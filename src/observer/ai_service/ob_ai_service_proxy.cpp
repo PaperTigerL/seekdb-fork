@@ -32,6 +32,27 @@ using namespace oceanbase::common;
 using namespace oceanbase::sqlclient;
 using namespace oceanbase::transaction;
 
+namespace
+{
+// Copy an endpoint column into the endpoint struct.
+// deep_copy_ob_string() maps an empty value to a null pointer, which makes the
+// dml splicer write SQL NULL for that column. An empty access key is legal for
+// providers that need no authentication (e.g. ollama), so keep it as an empty
+// string to make the value survive an update round trip.
+int deep_copy_ai_endpoint_string(ObIAllocator &allocator,
+                                  const ObString &src,
+                                  ObString &dst)
+{
+  int ret = OB_SUCCESS;
+  if (src.empty()) {
+    dst.assign_ptr("", 0);
+  } else if (OB_FAIL(deep_copy_ob_string(allocator, src, dst))) {
+    ret = OB_ERR_UNEXPECTED;
+  }
+  return ret;
+}
+} // namespace
+
 int ObAiServiceProxy::insert_ai_endpoint(ObMySQLTransaction &trans, const int64_t new_endpoint_version, const ObAiModelEndpointInfo &endpoint)
 {
   int ret = OB_SUCCESS;
@@ -200,7 +221,9 @@ int ObAiServiceProxy::build_ai_endpoint_(ObArenaAllocator &allocator, ObMySQLRes
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "endpoint_name", name);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "ai_model_name", ai_model_name);
   EXTRACT_VARCHAR_FIELD_MYSQL(result, "url", url);
-  EXTRACT_VARCHAR_FIELD_MYSQL(result, "access_key", access_key);
+  // an empty access key is valid for providers that need no authentication, and
+  // it may be stored as SQL NULL, so tolerate a null value here
+  EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "access_key", access_key, true, false, ""/*empty access key*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "provider", provider, true, false, ""/*wont be used*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "request_model_name", request_model_name, true, false, ""/*wont be used*/);
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "parameters", arguments, true, false, ""/*wont be used*/);
@@ -208,16 +231,16 @@ int ObAiServiceProxy::build_ai_endpoint_(ObArenaAllocator &allocator, ObMySQLRes
   EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(result, "response_transform_fn", response_transform_fn, true, false, ""/*wont be used*/);
 
   if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, scope, endpoint.scope_))) {
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, name, endpoint.name_))) {
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, ai_model_name, endpoint.ai_model_name_))) {
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, url, endpoint.url_))) {
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, access_key, endpoint.access_key_))) {
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, provider, endpoint.provider_))) {
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, request_model_name, endpoint.request_model_name_))) {
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, arguments, endpoint.parameters_))) {
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, request_transform_fn, endpoint.request_transform_fn_))) {
-  } else if (OB_FAIL(deep_copy_ob_string(allocator, response_transform_fn, endpoint.response_transform_fn_))) {
+  } else if (OB_FAIL(deep_copy_ai_endpoint_string(allocator, scope, endpoint.scope_))) {
+  } else if (OB_FAIL(deep_copy_ai_endpoint_string(allocator, name, endpoint.name_))) {
+  } else if (OB_FAIL(deep_copy_ai_endpoint_string(allocator, ai_model_name, endpoint.ai_model_name_))) {
+  } else if (OB_FAIL(deep_copy_ai_endpoint_string(allocator, url, endpoint.url_))) {
+  } else if (OB_FAIL(deep_copy_ai_endpoint_string(allocator, access_key, endpoint.access_key_))) {
+  } else if (OB_FAIL(deep_copy_ai_endpoint_string(allocator, provider, endpoint.provider_))) {
+  } else if (OB_FAIL(deep_copy_ai_endpoint_string(allocator, request_model_name, endpoint.request_model_name_))) {
+  } else if (OB_FAIL(deep_copy_ai_endpoint_string(allocator, arguments, endpoint.parameters_))) {
+  } else if (OB_FAIL(deep_copy_ai_endpoint_string(allocator, request_transform_fn, endpoint.request_transform_fn_))) {
+  } else if (OB_FAIL(deep_copy_ai_endpoint_string(allocator, response_transform_fn, endpoint.response_transform_fn_))) {
   }
 
   if (OB_SUCC(ret)) {
