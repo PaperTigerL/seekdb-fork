@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_update_resolver.h"
+#include "sql/resolver/dml/ob_select_resolver.h"
 
 namespace oceanbase
 {
@@ -149,6 +150,25 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
     } else if (OB_FAIL(update_stmt->check_dml_source_from_join())) {
     } else if (OB_FAIL(check_safe_update_mode(update_stmt))) {
     } else { /*do nothing*/ }
+  }
+
+  /* the strict read of the AI columns, the statement is rejected when it reads
+   * an AI column which is not READY for every row of its table */
+  if (OB_SUCC(ret)) {
+    common::ObSEArray<ObRawExpr *, 16> ai_exprs;
+    const common::ObIArray<ObRawExpr *> &conditions = update_stmt->get_condition_exprs();
+    for (int64_t i = 0; OB_SUCC(ret) && i < conditions.count(); ++i) {
+      if (OB_FAIL(ai_exprs.push_back(conditions.at(i)))) {
+      }
+    }
+    if (OB_SUCC(ret)
+        && OB_FAIL(ObSelectResolver::check_ai_column_strict_read_of_dml(session_info_,
+                                                                         schema_checker_,
+                                                                         *allocator_,
+                                                                         update_stmt,
+                                                                         ai_exprs))) {
+      LOG_WARN("failed to check the strict read of the ai columns", K(ret));
+    }
   }
   return ret;
 }

@@ -1301,7 +1301,16 @@ int ObSchemaServiceSQLImpl::get_sys_variable_schema(
     for (int64_t i = 0; OB_SUCC(ret) && i < ObSysVariables::get_amount(); i++) {
       ObSysVarClassType sys_var_id = ObSysVariables::get_sys_var_id(i);
       const ObSysVarSchema *sys_var = NULL;
-      if (OB_FAIL(sys_variable_schema.get_sysvar_schema(sys_var_id, sys_var))) {
+      int tmp_ret = sys_variable_schema.get_sysvar_schema(sys_var_id, sys_var);
+      if (OB_ERR_SYS_VARIABLE_UNKNOWN == tmp_ret) {
+        // The persisted inner table does not know this system variable yet, e.g. it was
+        // just introduced by a binary upgrade. Mock it with its hardcoded default value
+        // so that the runtime schema stays complete and the observer can start up.
+        if (OB_FAIL(sys_variable_schema.mock_default_sysvar_schema(i))) {
+          ret = tmp_ret;
+        }
+      } else if (OB_FAIL(tmp_ret)) {
+        ret = tmp_ret;
       } else if (OB_ISNULL(sys_var)) {
         ret = OB_ERR_UNEXPECTED;
       } else {

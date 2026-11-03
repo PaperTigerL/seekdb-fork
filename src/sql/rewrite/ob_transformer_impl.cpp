@@ -73,9 +73,61 @@ int ObTransformerImpl::transform(ObDMLStmt *&stmt)
   } else if (OB_FAIL(stmt->formalize_stmt_expr_reference(ctx_->expr_factory_, ctx_->session_info_))) {
   } else if (OB_FAIL(do_transform(stmt))) {
   } else if (OB_FAIL(stmt->formalize_stmt_expr_reference(ctx_->expr_factory_, ctx_->session_info_))) {
+  } else if (OB_FAIL(transform_file_table(stmt))) {
   } else if (OB_FAIL(do_after_transform(stmt, ctx_->session_info_))) {
   } else {
     print_trans_stat();
+  }
+  return ret;
+}
+
+/**
+ * 文件表（read_csv / read_json / read_parquet / glob）的重写阶段处理。
+ *
+ * 文件表的每一列都必须作为可解析的列存在（供 SELECT id, name ... 与 SELECT * 使用），
+ * 并且列号从 0 开始、与 ObFileTableDef::columns_ 的顺序严格一致——执行期的算子按这个
+ * 顺序把文件里的第 i 个字段写入第 i 个输出列。这里做一次校验，避免不一致时在优化器
+ * 深处才报错。
+ */
+int ObTransformerImpl::transform_file_table(ObDMLStmt *stmt)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(stmt)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    ObIArray<TableItem *> &table_items = stmt->get_table_items();
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_items.count(); ++i) {
+      TableItem *table_item = table_items.at(i);
+      if (OB_ISNULL(table_item)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (TableItem::FILE_TABLE != table_item->type_) {
+        continue;
+      } else {
+        ObFileTableDef *table_def = table_item->file_table_def_;
+        if (OB_ISNULL(table_def) || OB_UNLIKELY(table_def->columns_.count() <= 0)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("file table def is not ready", K(ret), K(table_item->table_id_));
+        } else {
+          ObSEArray<ColumnItem, 16> column_items;
+          if (OB_FAIL(stmt->get_column_items(table_item->table_id_, column_items))) {
+          } else if (OB_UNLIKELY(column_items.count() != table_def->columns_.count())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("file table column count mismatch",
+                     K(ret), K(column_items.count()), K(table_def->columns_.count()));
+          } else {
+            for (int64_t j = 0; OB_SUCC(ret) && j < column_items.count(); ++j) {
+              const ColumnItem &column_item = column_items.at(j);
+              if (OB_ISNULL(column_item.expr_) ||
+                  OB_UNLIKELY(column_item.column_id_ != common::OB_APP_MIN_COLUMN_ID + j)) {
+                ret = OB_ERR_UNEXPECTED;
+                LOG_WARN("file table column id mismatch",
+                         K(ret), K(j), K(column_item.column_id_));
+              }
+            }
+          }
+        }
+      }
+    }
   }
   return ret;
 }

@@ -27,6 +27,7 @@
 #include "storage/tablelock/ob_table_lock_rpc_struct.h"
 #include "observer/ob_uniq_task_queue.h"
 #include "observer/ob_tablet_runtime_meta_updater.h"
+#include "observer/ai_column/ob_ai_column_worker.h"
 #include "query/change_stream/ob_change_stream_service.h"
 #include "query/command/ob_local_command_service.h"
 #include "rootserver/ob_rootserver_local_runtime.h"
@@ -177,6 +178,8 @@ private:
   query::ObIChangeStreamService &change_stream_service_;
   ObSchemaReleaseTimeTask schema_release_task_;
   TelemetryTask telemetry_task_;
+  /* the background worker which computes the results of the AI columns */
+  ObAiColumnWorker ai_column_worker_;
 };
 
 }//end namespace observer

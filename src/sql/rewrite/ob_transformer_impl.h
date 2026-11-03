@@ -73,6 +73,7 @@ public:
   {
   }
   int transform(ObDMLStmt *&stmt);
+  int transform_file_table(ObDMLStmt *stmt);
   int do_transform(ObDMLStmt *&stmt);
   int do_transform_pre_precessing(ObDMLStmt *&stmt);
   int transform_heuristic_rule(ObDMLStmt *&stmt);

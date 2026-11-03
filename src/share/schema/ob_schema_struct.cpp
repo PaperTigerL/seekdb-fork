@@ -941,6 +941,38 @@ int ObSysVariableSchema::load_default_system_variable()
   return ret;
 }
 
+int ObSysVariableSchema::mock_default_sysvar_schema(int64_t index)
+{
+  int ret = OB_SUCCESS;
+  ObString value;
+  ObSysVarSchema sysvar;
+  if (index < 0 || index >= ObSysVariables::get_amount()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid system variable index", K(ret), K(index));
+  } else {
+    sysvar.reset();
+    if (ObCharset::case_insensitive_equal(ObSysVariables::get_name(index), OB_SV_LOWER_CASE_TABLE_NAMES)) {
+      value = ObString::make_string("2");
+    } else {
+      value = ObSysVariables::get_value(index);
+    }
+    sysvar.set_data_type(ObSysVariables::get_type(index));
+    sysvar.set_flags(ObSysVariables::get_flags(index));
+    sysvar.set_schema_version(get_schema_version());
+    if (OB_FAIL(sysvar.set_name(ObSysVariables::get_name(index)))) {
+    } else if (OB_FAIL(sysvar.set_value(value))) {
+    } else if (OB_FAIL(sysvar.set_min_val(ObSysVariables::get_min(index)))) {
+    } else if (OB_FAIL(sysvar.set_max_val(ObSysVariables::get_max(index)))) {
+    } else if (OB_FAIL(sysvar.set_info(ObSysVariables::get_info(index)))) {
+    } else if (OB_FAIL(add_sysvar_schema(sysvar))) {
+    } else {
+      LOG_INFO("mock missing system variable schema with default value",
+               "name", ObSysVariables::get_name(index));
+    }
+  }
+  return ret;
+}
+
 int64_t ObSysVariableSchema::get_real_sysvar_count() const
 {
   int64_t sysvar_cnt = 0;

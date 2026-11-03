@@ -2446,6 +2446,35 @@ all_ai_model_endpoint_def = dict(
 )
 def_table_schema(**all_ai_model_endpoint_def)
 
+all_ai_column_task_def = dict(
+    owner = 'competition',
+    table_name = '__all_ai_column_task',
+    table_id = '1132',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    # the request id is part of the rowkey because one AI column of one table
+    # owns one task per changed row, the request id is shared by all the AI
+    # columns of one row and it identifies the group of the tasks which have to
+    # be published together
+    rowkey_columns = [
+      ('table_id', 'int'),
+      ('column_id', 'int'),
+      ('request_id', 'varchar:128')
+    ],
+
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('rowkey_predicate', 'varchar:2048'),
+        ('state', 'int', 'false', '0'),
+        ('retry_count', 'int', 'false', '0'),
+        ('eligible_ts', 'timestamp', 'true'),
+        ('last_error', 'varchar:1024', 'true'),
+        ('request_payload', 'varchar:4096', 'true')
+    ]
+)
+def_table_schema(**all_ai_column_task_def)
+
 
 all_objauth_mysql_def = dict(
     owner = 'cjl476581',
@@ -2721,6 +2750,36 @@ def_table_schema(
   ('message', 'varchar:512'),# the same as warning buffer length
   ('ori_code', 'int'),
   ('sql_state', 'varchar:6')
+  ]
+  )
+
+
+# 10010: __all_ai_column
+# Virtual table: rows are computed on the fly from the AI column metadata that is
+# persisted in the AI column comment of the owning user table.
+def_table_schema(
+  owner = 'competition',
+  table_name     = '__all_ai_column',
+  table_id       = '10010',
+  table_type = 'VIRTUAL_TABLE',
+  gm_columns = [],
+  rowkey_columns = [
+  ('table_id', 'int'),
+  ('column_id', 'int')
+  ],
+
+  normal_columns = [
+  ('column_name', 'varchar:OB_MAX_COLUMN_NAME_LENGTH'),
+  ('max_retries', 'int', 'false', '0'),
+  ('normalized_expr', 'varchar:4096'),
+  ('state_column_id', 'int', 'false', '0'),
+  ('request_column_id', 'int', 'false', '0'),
+  ('result_spec_column_id', 'int', 'false', '0'),
+  ('ai_model_name', 'varchar:128', 'false'),
+  ('ai_func_type', 'int', 'false', '0'),
+  ('sync_mode', 'varchar:32', 'false', "'async'"),
+  ('vector_dim', 'int', 'true'),
+  ('result_type', 'varchar:64', 'true')
   ]
   )
 
@@ -13821,6 +13880,57 @@ def_table_schema(
       REQUEST_TRANSFORM_FN,
       RESPONSE_TRANSFORM_FN
     FROM oceanbase.__all_ai_model_endpoint WHERE ENDPOINT_ID != -1;
+  """.replace("\n", " ")
+)
+
+def_table_schema(
+  owner           = 'competition',
+  table_name      = 'DBA_OB_AI_COLUMNS',
+  table_id        = '21665',
+  table_type      = 'SYSTEM_VIEW',
+  rowkey_columns  = [],
+  normal_columns  = [],
+  gm_columns      = [],
+  view_definition =
+  """
+    SELECT
+      TABLE_ID,
+      COLUMN_ID,
+      COLUMN_NAME,
+      AI_MODEL_NAME,
+      AI_FUNC_TYPE,
+      NORMALIZED_EXPR,
+      MAX_RETRIES,
+      SYNC_MODE,
+      STATE_COLUMN_ID,
+      REQUEST_COLUMN_ID,
+      RESULT_SPEC_COLUMN_ID,
+      VECTOR_DIM,
+      RESULT_TYPE
+    FROM oceanbase.__all_ai_column;
+  """.replace("\n", " ")
+)
+
+def_table_schema(
+  owner           = 'competition',
+  table_name      = 'DBA_OB_AI_COLUMN_TASKS',
+  table_id        = '21666',
+  table_type      = 'SYSTEM_VIEW',
+  rowkey_columns  = [],
+  normal_columns  = [],
+  gm_columns      = [],
+  view_definition =
+  """
+    SELECT
+      TABLE_ID,
+      COLUMN_ID,
+      REQUEST_ID,
+      ROWKEY_PREDICATE,
+      STATE,
+      RETRY_COUNT,
+      ELIGIBLE_TS,
+      LAST_ERROR
+    FROM oceanbase.__all_ai_column_task;
   """.replace("\n", " ")
 )
 

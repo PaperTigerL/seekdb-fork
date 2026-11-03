@@ -86,6 +86,49 @@ public:
   int get_current_recursive_cte_table(ObSelectStmt* ref_stmt);
   void set_current_recursive_cte_table_item(TableItem *table_item) { current_recursive_cte_table_item_ = table_item; }
   void set_current_cte_involed_stmt(ObSelectStmt *stmt) { current_cte_involed_stmt_ = stmt; }
+  /**
+   * The strict read of the AI columns.
+   *
+   * When the system variable ai_column_strict_read is on, a statement which
+   * reads the result of an AI column is rejected with OB_AI_COLUMN_NOT_READY
+   * unless every row of the table owns a READY result of that AI column.
+   *
+   * The check is column wide, it does not depend on the rows which the
+   * statement selects, and only the AI columns which the statement really
+   * references are checked.
+   *
+   * @param session_info the session of the statement
+   * @param schema_checker the schema checker of the statement
+   * @param allocator the allocator of the statement
+   * @param exprs the expressions of the statement
+   */
+  static int check_ai_column_strict_read(ObSQLSessionInfo *session_info,
+                                          ObSchemaChecker *schema_checker,
+                                          common::ObIAllocator &allocator,
+                                          const common::ObIArray<ObRawExpr *> &exprs);
+  /* the strict read of the AI columns of one select statement */
+  static int check_ai_column_strict_read_of_select(ObSQLSessionInfo *session_info,
+                                                    ObSchemaChecker *schema_checker,
+                                                    common::ObIAllocator &allocator,
+                                                    ObSelectStmt *select_stmt);
+  /* the strict read of the AI columns of one DML statement */
+  static int check_ai_column_strict_read_of_dml(ObSQLSessionInfo *session_info,
+                                                 ObSchemaChecker *schema_checker,
+                                                 common::ObIAllocator &allocator,
+                                                 ObDMLStmt *stmt,
+                                                 const common::ObIArray<ObRawExpr *> &exprs);
+  /* collect the AI columns which the expressions reference */
+  static int collect_ai_columns(ObSchemaChecker *schema_checker,
+                                 common::ObIAllocator &allocator,
+                                 const common::ObIArray<ObRawExpr *> &exprs,
+                                 common::ObSEArray<uint64_t, 8> &table_ids,
+                                 common::ObSEArray<uint64_t, 8> &column_ids);
+  /* check that every row of the table owns a READY result of the AI column */
+  static int check_ai_column_ready(ObSQLSessionInfo *session_info,
+                                    ObSchemaChecker *schema_checker,
+                                    common::ObIAllocator &allocator,
+                                    const uint64_t table_id,
+                                    const uint64_t column_id);
   int check_auto_gen_column_names();
 
   void set_is_top_stmt(bool is_top_stmt) { is_top_stmt_ = is_top_stmt; }

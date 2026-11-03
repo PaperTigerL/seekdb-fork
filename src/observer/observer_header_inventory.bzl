@@ -187,6 +187,8 @@ OBSERVER_PRIVATE_HEADERS = [
     "virtual_table/ob_all_virtual_vector_index_info.h",
     "virtual_table/ob_global_variables.h",
     "virtual_table/ob_gv_sql.h",
+    "virtual_table/ob_all_ai_column.h",
+    "ai_column/ob_ai_column_worker.h",
     "virtual_table/ob_information_check_constraints_table.h",
     "virtual_table/ob_information_columns_table.h",
     "virtual_table/ob_information_global_status_table.h",

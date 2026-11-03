@@ -102,6 +102,8 @@
 #include "sql/engine/expand/ob_expand_vec_op.h"
 #include "sql/optimizer/ob_log_values_table_access.h"
 #include "sql/engine/basic/ob_values_table_access_op.h"
+#include "sql/optimizer/ob_log_file_table_access.h"
+#include "sql/engine/basic/ob_file_table_access_op.h"
 
 namespace oceanbase
 {
@@ -1738,6 +1740,60 @@ int ObStaticEngineCG::generate_spec(ObLogValuesTableAccess &op,
       } else {
         spec.rows_ = table_def->row_cnt_;
       }
+    }
+  }
+  return ret;
+}
+
+int ObStaticEngineCG::generate_spec(ObLogFileTableAccess &op,
+                                    ObFileTableAccessSpec &spec,
+                                    const bool in_root_job)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(in_root_job);
+  const ObFileTableDef *table_def = NULL;
+  if (OB_ISNULL(table_def = op.get_file_table_def()) ||
+      OB_UNLIKELY(op.get_output_exprs().empty())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    spec.format_ = static_cast<int32_t>(table_def->format_);
+    spec.has_header_ = table_def->has_header_;
+    spec.sample_size_ = table_def->sample_size_;
+    spec.row_cnt_ = table_def->row_cnt_;
+    spec.is_glob_ = table_def->is_glob_;
+    // 路径需要深拷贝到物理计划的内存里，保证执行期不依赖 stmt 的生命周期。
+    char *path_buf = NULL;
+    if (table_def->path_.length() > 0) {
+      ObIAllocator &allocator = phy_plan_->get_allocator();
+      path_buf = static_cast<char *>(allocator.alloc(table_def->path_.length()));
+      if (OB_ISNULL(path_buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        MEMCPY(path_buf, table_def->path_.ptr(), table_def->path_.length());
+      }
+    }
+    if (OB_SUCC(ret)) {
+      spec.path_.assign(path_buf, table_def->path_.length());
+    }
+    if (OB_SUCC(ret) && OB_FAIL(spec.column_exprs_.prepare_allocate(op.get_column_exprs().count()))) {
+    } else if (OB_SUCC(ret)) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < op.get_column_exprs().count(); i++) {
+        ObColumnRefRawExpr *col_expr = op.get_column_exprs().at(i);
+        ObExpr *expr = NULL;
+        if (OB_ISNULL(col_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(mark_expr_self_produced(col_expr))) {
+        } else if (OB_FAIL(generate_rt_expr(*col_expr, expr))) {
+        } else if (OB_ISNULL(expr)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          spec.column_exprs_.at(i) = expr;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(mark_expr_self_produced(op.get_output_exprs()))) {
+    } else if (OB_SUCC(ret)) {
+      spec.rows_ = table_def->row_cnt_;
     }
   }
   return ret;
@@ -5460,6 +5516,7 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
   } else if (OB_FAIL(spec.external_properties_.store_str(op.get_external_properties()))) {
   } else if (OB_FAIL(spec.user_vars_.init(op.get_user_vars().count()))) {
   } else if (OB_FAIL(spec.select_exprs_.init(op.get_select_exprs().count()))) {
+  } else if (OB_FAIL(spec.column_names_.init(op.get_column_names().count()))) {
   } else {
     ObString var;
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_user_vars().count(); ++i) {
@@ -5477,6 +5534,19 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
       } else if (OB_FAIL(spec.select_exprs_.push_back(rt_expr))) {
       }
     }
+    for (int64_t i = 0; OB_SUCC(ret) && i < op.get_column_names().count(); ++i) {
+      ObString col_name;
+      if (OB_FAIL(ob_write_string(alloc, op.get_column_names().at(i), col_name))) {
+      } else if (OB_FAIL(spec.column_names_.push_back(col_name))) {
+      }
+    }
+    if (OB_SUCC(ret) && !op.get_null_str().empty()) {
+      ObString null_str;
+      if (OB_FAIL(ob_write_string(alloc, op.get_null_str(), null_str))) {
+      } else {
+        spec.null_str_ = null_str;
+      }
+    }
     if (OB_SUCC(ret)) {
       spec.into_type_ = op.get_into_type();
       spec.is_optional_ = op.get_is_optional();
@@ -5486,6 +5556,7 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
       spec.cs_type_ = op.get_cs_type();
       spec.parallel_ = op.get_parallel();
       spec.is_overwrite_ = op.get_is_overwrite();
+      spec.write_header_ = op.get_write_header();
       spec.plan_->need_drive_dml_query_ = true;
     }
   }
@@ -6149,6 +6220,10 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
     }
     case log_op_def::LOG_VALUES_TABLE_ACCESS: {
       type = PHY_VALUES_TABLE_ACCESS;
+      break;
+    }
+    case log_op_def::LOG_FILE_TABLE_ACCESS: {
+      type = PHY_FILE_TABLE_ACCESS;
       break;
     }
     case log_op_def::LOG_EXPAND: {

@@ -795,6 +795,16 @@ int ObTableModifyOp::inner_close()
 {
   int ret = OB_SUCCESS;
   ObPhysicalPlanCtx *plan_ctx = ctx_.get_physical_plan_ctx();
+  /* the AI column hook creates the tasks of the changed rows and invalidates the
+   * results of the AI columns. It runs when the statement is closed, after every
+   * row of the DML has been written, otherwise the DML would overwrite the
+   * invalidation with the old value of the AI column */
+  if (ai_column_pending_stmts_.count() > 0) {
+    const int flush_ret = ObAiColumnDmlHook::flush(*this);
+    if (OB_SUCCESS != flush_ret) {
+      LOG_WARN("failed to execute the statements of the AI column hook", K(flush_ret));
+    }
+  }
   // release cache_handle for auto-increment
   share::ObAutoincrementService &auto_service = share::ObAutoincrementService::get_instance();
   ObIArray<share::AutoincParam> &autoinc_params = plan_ctx->get_autoinc_params();

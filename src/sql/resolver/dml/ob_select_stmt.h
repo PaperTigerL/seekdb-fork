@@ -128,7 +128,10 @@ struct ObSelectIntoItem
         max_file_size_(DEFAULT_MAX_FILE_SIZE),
         escaped_cht_(),
         buffer_size_(DEFAULT_BUFFER_SIZE),
-        external_properties_()
+        external_properties_(),
+        write_header_(false),
+        null_str_(),
+        column_names_()
   {
     field_str_.set_varchar(DEFAULT_FIELD_TERM_STR);
     field_str_.set_collation_type(ObCharset::get_system_collation());
@@ -186,6 +189,12 @@ struct ObSelectIntoItem
   common::ObCollationType cs_type_;
   int64_t buffer_size_;
   common::ObString external_properties_;
+  /* write the names of the output columns as the first line of the file, used by the copy statement */
+  bool write_header_;
+  /* the text that represents a null value, empty means the default '\N' is used */
+  common::ObString null_str_;
+  /* the names of the output columns, they are written as the header line of the file */
+  common::ObSEArray<common::ObString, 16, common::ModulePageAllocator, true> column_names_;
 
   static const char* const DEFAULT_FIELD_TERM_STR;
   static const char* const DEFAULT_LINE_TERM_STR;

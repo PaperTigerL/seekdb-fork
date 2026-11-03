@@ -21,6 +21,8 @@
 #include "sql/resolver/dml/ob_delete_resolver.h"
 #include "sql/resolver/ddl/ob_index_builder_util.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
+#include "sql/resolver/ddl/ob_ai_column_resolver.h"
+#include "sql/resolver/ddl/ob_ai_column_retry_resolver.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "sql/session/ob_local_session_var.h"
 #include "query/command/ob_root_command_service.h"
@@ -585,6 +587,16 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
         case T_MODIFY_ALL_TRIGGERS: {
             alter_table_stmt->set_is_alter_triggers(true);
             if (OB_FAIL(resolve_modify_all_trigger(*action_node))) {
+            }
+            break;
+        }
+        case T_RETRY_AI_COLUMN: {
+            /* the RETRY AI COLUMN action can not be mixed with another action */
+            if (node.num_child_ > 1) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                             "combining AI COLUMN RETRY with another ALTER action");
+            } else if (OB_FAIL(resolve_retry_ai_column(*action_node))) {
             }
             break;
         }
@@ -3459,6 +3471,62 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
           }
         }
+
+        /* Create the hidden columns of the AI column and check that the AI column
+         * does not depend on another AI column.  The metadata of the AI columns is
+         * stored in the comment of the AI columns, see ob_ai_column_resolver.h. */
+        if (OB_SUCC(ret) && is_ai_column(alter_column_schema)) {
+          ObAiColumnMeta ai_meta;
+          bool is_ai_meta = false;
+          if (OB_FAIL(ai_column_meta_from_comment(alter_column_schema.get_comment_str(),
+                                                  *allocator_, ai_meta, is_ai_meta))) {
+          } else if (!is_ai_meta) {
+          } else {
+            ObTableSchema &alter_table_schema = alter_table_stmt->get_alter_table_schema();
+            /* an AI column must not depend on another AI column */
+            ObSEArray<uint64_t, 16> dep_column_ids;
+            if (OB_FAIL(collect_ai_expr_dep_columns(ai_meta.input_expr_, alter_table_schema,
+                                                     *allocator_, alter_column_schema.get_column_id(),
+                                                     dep_column_ids))) {
+            } else {
+              for (int64_t j = 0; OB_SUCC(ret) && j < dep_column_ids.count(); ++j) {
+                const ObColumnSchemaV2 *dep_col = alter_table_schema.get_column_schema(dep_column_ids.at(j));
+                if (OB_NOT_NULL(dep_col) && is_ai_column(*dep_col)) {
+                  ret = OB_NOT_SUPPORTED;
+                  SQL_RESV_LOG(WARN, "an AI column can not depend on another AI column", K(ret));
+                  break;
+                }
+              }
+            }
+            /* create the three hidden columns of the AI column */
+            if (OB_SUCC(ret)) {
+              ObString state_name;
+              ObString request_name;
+              ObString result_spec_name;
+              if (OB_FAIL(get_ai_column_hidden_names(alter_column_schema.get_column_name_str(),
+                                                     *allocator_, state_name, request_name,
+                                                     result_spec_name))) {
+              } else {
+                AlterColumnSchema state_col;
+                AlterColumnSchema request_col;
+                AlterColumnSchema result_spec_col;
+                state_col.alter_type_ = OB_DDL_ADD_COLUMN;
+                request_col.alter_type_ = OB_DDL_ADD_COLUMN;
+                result_spec_col.alter_type_ = OB_DDL_ADD_COLUMN;
+                if (OB_FAIL(fill_ai_hidden_column(state_col, state_name, ObInt32Type, 0))) {
+                } else if (OB_FAIL(fill_ai_hidden_column(request_col, request_name, ObVarcharType,
+                                                         OB_AI_COLUMN_REQUEST_LENGTH))) {
+                } else if (OB_FAIL(fill_ai_hidden_column(result_spec_col, result_spec_name,
+                                                         ObVarcharType,
+                                                         OB_AI_COLUMN_RESULT_SPEC_LENGTH))) {
+                } else if (OB_FAIL(alter_table_stmt->add_column(state_col))) {
+                } else if (OB_FAIL(alter_table_stmt->add_column(request_col))) {
+                } else if (OB_FAIL(alter_table_stmt->add_column(result_spec_col))) {
+                }
+              }
+            }
+          }
+        }
       }
     }
     add_column_cnt_++;
@@ -4384,6 +4452,40 @@ int ObAlterTableResolver::resolve_modify_all_trigger(const ParseNode &node)
       OZ (alter_table_stmt->get_tg_arg().trigger_infos_.push_back(new_tg_arg));
       LOG_DEBUG("alter table all triggers", K(new_tg_arg.get_trigger_id()), K(ret));
     }
+  }
+  return ret;
+}
+
+int ObAlterTableResolver::resolve_retry_ai_column(const ParseNode &node)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  ObAiColumnRetryInfo retry_info;
+  ObString column_name;
+  ObString predicate_text;
+  if (OB_ISNULL(alter_table_stmt) || OB_ISNULL(table_schema_) || OB_ISNULL(allocator_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid parse tree", K(ret));
+  } else if (node.num_child_ <= 0 || OB_ISNULL(node.children_) || OB_ISNULL(node.children_[0])
+             || OB_ISNULL(node.children_[0]->str_value_) || node.children_[0]->str_len_ <= 0) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid parse tree", K(ret));
+  } else {
+    column_name.assign_ptr(node.children_[0]->str_value_, node.children_[0]->str_len_);
+    /* the text of the predicate is the text of the WHERE clause of the action */
+    if (NULL != node.str_value_ && node.str_len_ > 0) {
+      predicate_text.assign_ptr(node.str_value_, node.str_len_);
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(ObAiColumnRetryResolver::resolve_retry_ai_column(*table_schema_,
+                                                                                database_name_,
+                                                                                column_name,
+                                                                                predicate_text,
+                                                                                *allocator_,
+                                                                                retry_info))) {
+    SQL_RESV_LOG(WARN, "failed to resolve the retry ai column action", K(ret));
+  } else if (OB_SUCC(ret)) {
+    alter_table_stmt->set_retry_ai_column(retry_info.invalidate_sql_, retry_info.task_sql_);
   }
   return ret;
 }

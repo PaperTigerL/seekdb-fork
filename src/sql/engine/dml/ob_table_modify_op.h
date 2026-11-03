@@ -19,6 +19,7 @@
 
 #include "sql/engine/ob_operator.h"
 #include "sql/engine/dml/ob_dml_ctx_define.h"
+#include "sql/engine/dml/ob_ai_column_dml_hook.h"
 #include "sql/session/ob_inner_sql_connection.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/dml/ob_fk_checker.h"
@@ -313,6 +314,9 @@ public:
   ObDMLModifyRowsList dml_modify_rows_;
   ObSEArray<ObForeignKeyChecker *, 4> fk_checkers_;
   ObChunkDatumStore::ShadowStoredRow last_store_row_;
+  /* the statements of the AI column hook which are executed when the DML
+   * operator has written all of its rows */
+  ObAiColumnDmlHook::StmtArray ai_column_pending_stmts_;
 private:
   ObSQLSessionInfo::StmtSavedValue *saved_session_;
   char saved_session_buf_[sizeof(ObSQLSessionInfo::StmtSavedValue)] __attribute__((aligned (16)));;

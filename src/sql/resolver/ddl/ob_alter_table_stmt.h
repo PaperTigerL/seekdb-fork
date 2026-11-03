@@ -104,6 +104,21 @@ public:
     alter_table_arg_.lock_session_create_ts_ = create_ts;
   }
   void set_lock_priority();
+  /* the RETRY AI COLUMN action does not change the schema of the table, it
+   * invalidates the results of one AI column and it creates the tasks of the
+   * worker, so the executor runs the statements of the action instead of
+   * running a DDL */
+  bool is_retry_ai_column() const { return is_retry_ai_column_; }
+  void set_is_retry_ai_column(const bool flag) { is_retry_ai_column_ = flag; }
+  const common::ObString &get_retry_invalidate_sql() const { return retry_invalidate_sql_; }
+  const common::ObString &get_retry_task_sql() const { return retry_task_sql_; }
+  void set_retry_ai_column(const common::ObString &invalidate_sql,
+                           const common::ObString &task_sql)
+  {
+    retry_invalidate_sql_ = invalidate_sql;
+    retry_task_sql_ = task_sql;
+    is_retry_ai_column_ = true;
+  }
 private:
   obcall::ObAlterTableArg alter_table_arg_;
   bool is_comment_table_;
@@ -114,6 +129,9 @@ private:
   obcall::ObAlterTriggerArg tg_arg_;
   uint64_t alter_table_action_count_;
   obcall::ObExchangePartitionArg exchange_partition_arg_;
+  bool is_retry_ai_column_;
+  common::ObString retry_invalidate_sql_;
+  common::ObString retry_task_sql_;
 };
 
 inline int ObAlterTableStmt::set_tz_info_wrap(const common::ObTimeZoneInfoWrap &tz_info_wrap)

@@ -769,6 +769,26 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
           [&]{ return ctx.root_command_service().alter_trigger(stmt.get_tg_arg()); }),
           GCTX.self_addr());
     }
+  } else if (stmt.is_retry_ai_column()) {
+    /* the RETRY AI COLUMN action does not change the schema of the table, it
+     * invalidates the results of the AI column and it creates the tasks of the
+     * worker, so there is no DDL to run */
+    ObSQLSessionInfo *my_session = ctx.get_my_session();
+    common::sqlclient::ObISQLConnection *conn = NULL;
+    common::sqlclient::ObISQLConnectionGuard conn_guard;
+    int64_t affected_rows = 0;
+    if (OB_ISNULL(my_session)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(query::ObInnerSQLConnectionAccess::
+                           create_connection_with_external_session(my_session, conn_guard))) {
+      LOG_WARN("failed to create the inner sql connection of the retry ai column", K(ret));
+    } else if (OB_ISNULL(conn = conn_guard.get_ptr())) {
+      ret = OB_INNER_STAT_ERROR;
+    } else if (OB_FAIL(conn->execute_write(stmt.get_retry_invalidate_sql(), affected_rows, true))) {
+      LOG_WARN("failed to invalidate the results of the ai column", K(ret));
+    } else if (OB_FAIL(conn->execute_write(stmt.get_retry_task_sql(), affected_rows, true))) {
+      LOG_WARN("failed to create the tasks of the ai column", K(ret));
+    }
   } else {
     ObSQLSessionInfo *my_session = NULL;
     obcall::ObAlterTableRes res;

@@ -146,6 +146,11 @@ int ObAiServiceProxy::select_ai_endpoint(ObArenaAllocator &allocator, ObISQLClie
           LOG_WARN("get more row than one", KR(ret), KR(tmp_ret), K(sql));
         }
       }
+      /* the result must be closed before the transaction uses the connection again */
+      const int close_ret = res.close();
+      if (OB_SUCCESS != close_ret && OB_SUCC(ret)) {
+        ret = close_ret;
+      }
     }
   }
   return ret;
@@ -195,6 +200,11 @@ int ObAiServiceProxy::select_ai_endpoint_by_ai_model_name(ObArenaAllocator &allo
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("get more row than one", KR(ret), KR(tmp_ret), K(sql));
         }
+      }
+      /* the result must be closed before the transaction uses the connection again */
+      const int close_ret = res.close();
+      if (OB_SUCCESS != close_ret && OB_SUCC(ret)) {
+        ret = close_ret;
       }
     }
   }

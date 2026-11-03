@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "config_bridge.h"
 #include "sql/engine/dml/ob_dml_service.h"
+#include "sql/engine/dml/ob_ai_column_dml_hook.h"
 #include "sql/engine/expr/ob_datum_cast.h"
 #include "share/rc/ob_server_runtime.h"
 #include "sql/das/ob_das_insert_op.h"
@@ -632,6 +633,13 @@ int ObDMLService::process_insert_row(const ObInsCtDef &ins_ctdef,
     }
 
   }
+  if (OB_SUCC(ret) && !is_skipped) {
+    /* the AI column hook creates the tasks of the inserted row */
+    const int hook_ret = ObAiColumnDmlHook::handle_insert(dml_op, ins_ctdef);
+    if (OB_SUCCESS != hook_ret) {
+      LOG_WARN("failed to collect the AI column tasks of the inserted row", K(hook_ret));
+    }
+  }
   return ret;
 }
 
@@ -734,6 +742,13 @@ int ObDMLService::process_delete_row(const ObDelCtDef &del_ctdef,
                "old_row", ROWEXPR2STR(dml_op.get_eval_ctx(), del_ctdef.old_row_));
   }
 
+  if (OB_SUCC(ret) && !is_skipped) {
+    /* the AI column hook cleans up the tasks of the deleted row */
+    const int hook_ret = ObAiColumnDmlHook::handle_delete(dml_op, del_ctdef);
+    if (OB_SUCCESS != hook_ret) {
+      LOG_WARN("failed to clean up the AI column tasks of the deleted row", K(hook_ret));
+    }
+  }
   return ret;
 }
 
@@ -831,6 +846,12 @@ int ObDMLService::process_update_row(const ObUpdCtDef &upd_ctdef,
     LOG_DEBUG("process update row", K(ret), K(is_skipped), K(upd_ctdef), K(upd_rtdef),
                 "old_row", ROWEXPR2STR(dml_op.get_eval_ctx(), upd_ctdef.old_row_),
                 "new_row", ROWEXPR2STR(dml_op.get_eval_ctx(), upd_ctdef.new_row_));
+    /* the AI column hook creates the tasks of the updated row and invalidates
+     * the results of the AI columns whose dependency columns were changed */
+    const int hook_ret = ObAiColumnDmlHook::handle_update(dml_op, upd_ctdef, upd_rtdef);
+    if (OB_SUCCESS != hook_ret) {
+      LOG_WARN("failed to collect the AI column tasks of the updated row", K(hook_ret));
+    }
   }
   return ret;
 }

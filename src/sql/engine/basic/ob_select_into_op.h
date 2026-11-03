@@ -52,7 +52,7 @@ private:
 
 class ObSelectIntoSpec : public ObOpSpec
 {
-  OB_UNIS_VERSION_V(1);
+  OB_UNIS_VERSION_V(2);
 public:
   ObSelectIntoSpec(common::ObIAllocator &alloc, const ObPhyOperatorType type)
     : ObOpSpec(alloc, type),
@@ -71,7 +71,10 @@ public:
       parallel_(1),
       buffer_size_(DEFAULT_BUFFER_SIZE),
       is_overwrite_(false),
-      external_properties_(alloc)
+      external_properties_(alloc),
+      write_header_(false),
+      null_str_(),
+      column_names_(alloc)
   {
   }
 
@@ -91,6 +94,12 @@ public:
   int64_t buffer_size_;
   bool is_overwrite_;
   ObExternalFileFormat::StringData external_properties_;
+  /* write the names of the output columns as the first line of the file */
+  bool write_header_;
+  /* the text that represents a null value, empty means the default '\N' is used */
+  common::ObString null_str_;
+  /* the names of the output columns, they are written as the header line of the file */
+  common::ObFixedArray<common::ObString, common::ObIAllocator> column_names_;
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };
@@ -126,7 +135,9 @@ public:
       external_properties_(),
       format_type_(ObExternalFileFormat::FormatType::CSV_FORMAT),
       block_id_(0),
-      need_commit_(true)
+      need_commit_(true),
+      header_written_(false),
+      null_str_()
   {
   }
 
@@ -240,6 +251,9 @@ private:
                              int64_t &pos,
                              ObCsvFileWriter &data_writer);
   int write_single_char_to_file(const char *wchar, ObCsvFileWriter &data_writer);
+  int write_null_str_to_file(ObCsvFileWriter &data_writer);
+  /* write the names of the output columns as the first line of the file */
+  int write_header(ObExternalFileWriter *data_writer);
   int write_lob_to_file(const ObObj &obj,
                         const ObExpr &expr,
                         const ObDatum &datum,
@@ -292,6 +306,10 @@ private:
   ObExternalFileFormat::FormatType format_type_;
   uint32_t block_id_;
   bool need_commit_;
+  /* whether the header line has been written to the file */
+  bool header_written_;
+  /* the text that represents a null value, empty means the default '\N' is used */
+  common::ObString null_str_;
   static const int64_t SHARED_BUFFER_SIZE = 2LL * 1024 * 1024;
 
 };

@@ -92,6 +92,8 @@
 #include "sql/resolver/ddl/ob_set_comment_resolver.h"
 #include "sql/resolver/expr/ob_raw_expr_wrap_enum_set.h"
 #include "sql/resolver/cmd/ob_get_diagnostics_resolver.h"
+#include "sql/resolver/cmd/ob_describe_select_resolver.h"
+#include "sql/resolver/cmd/ob_copy_to_file_resolver.h"
 #include "sql/resolver/dcl/ob_alter_role_resolver.h"
 #include "sql/pl/ob_pl_package.h"
 
@@ -474,6 +476,14 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
       }
       case T_EXPLAIN: {
         REGISTER_STMT_RESOLVER(Explain);
+        break;
+      }
+      case T_DESCRIBE_SELECT: {
+        REGISTER_STMT_RESOLVER(DescribeSelect);
+        break;
+      }
+      case T_COPY_TO_FILE: {
+        REGISTER_STMT_RESOLVER(CopyToFile);
         break;
       }
       case T_ALTER_SYSTEM_SET: {

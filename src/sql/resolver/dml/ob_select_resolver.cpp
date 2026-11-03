@@ -17,10 +17,16 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/dml/ob_select_resolver.h"
 #include "sql/resolver/dml/ob_del_upd_resolver.h"
+#include "sql/resolver/ddl/ob_ai_column_resolver.h"
+#include "sql/session/ob_system_variable.h"
+#include "sql/session/ob_inner_sql_connection.h"
+#include "query/session/ob_inner_sql_connection_access.h"
+#include "common/mysqlclient/ob_isql_connection.h"
 #include "share/ob_time_utility2.h"
 #include "sql/resolver/dml/ob_aggr_expr_push_up_analyzer.h"
 #include "sql/resolver/dml/ob_group_by_checker.h"
 #include "sql/resolver/dml/ob_insert_resolver.h"
+#include "sql/resolver/dml/ob_file_table_resolver.h"
 #include "sql/engine/expr/ob_expr_version.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/rewrite/ob_transform_utils.h"
@@ -1052,6 +1058,15 @@ int ObSelectResolver::resolve(const ParseNode &parse_tree)
     }
   }
 
+  /* the strict read of the AI columns, the statement is rejected when it reads
+   * an AI column which is not READY for every row of its table */
+  if (OB_SUCC(ret) && OB_FAIL(check_ai_column_strict_read_of_select(session_info_,
+                                                                    schema_checker_,
+                                                                    *allocator_,
+                                                                    select_stmt))) {
+    SQL_RESV_LOG(WARN, "failed to check the strict read of the ai columns", K(ret));
+  }
+
   return ret;
 }
 
@@ -1658,6 +1673,11 @@ int ObSelectResolver::expand_target_list(
     if (OB_ISNULL(get_stmt()) || OB_UNLIKELY(get_stmt()->get_column_size() == 0)) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(append(column_items, get_stmt()->get_column_items()))) {
+    }
+  } else if (TableItem::FILE_TABLE == table_item.type_) {
+    if (OB_FAIL(ObFileTableResolver::resolve_file_table_column_items(table_item,
+                                                                     get_stmt(),
+                                                                     column_items))) {
     }
   } else {
     ret = OB_ERR_UNEXPECTED;
@@ -2878,7 +2898,15 @@ int ObSelectResolver::resolve_into_const_node(const ParseNode *node, ObObj &obj)
     obj.set_varchar(node_str);
     obj.set_collation_type(CS_TYPE_BINARY);
   } else if (T_QUESTIONMARK == node->type_) {
-    obj.set_unknown(node->value_);
+    if (OB_NOT_NULL(node->str_value_)) {
+      // the fast parser keeps the text of a string literal on the parameterized node
+      ObCollationType cs_type = params_.session_info_->get_local_collation_connection();
+      ObString node_str(node->str_len_, node->str_value_);
+      obj.set_varchar(node_str);
+      obj.set_collation_type(cs_type);
+    } else {
+      obj.set_unknown(node->value_);
+    }
   } else {
     ret = OB_ERR_UNEXPECTED;
   }
@@ -4668,6 +4696,377 @@ int ObSelectResolver::resolve_values_table_from_union(const ObIArray<int64_t> &l
                                                            table_def->access_exprs_,
                                                            &table_def->column_types_))) {
     } else if (OB_FAIL(estimate_values_table_stats(*table_def))) {
+    }
+  }
+  return ret;
+}
+
+/* the store index of the system variable ai_column_strict_read, see
+ * src/share/system_variable/ob_system_variable_init.cpp */
+static const int64_t AI_COLUMN_STRICT_READ_STORE_IDX = 720;
+
+namespace
+{
+
+/* collect the columns which one expression references */
+int collect_ai_columns_of_expr(ObSchemaChecker *schema_checker,
+                                ObRawExpr *expr,
+                                common::ObSEArray<uint64_t, 8> &table_ids,
+                                common::ObSEArray<uint64_t, 8> &column_ids)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(schema_checker);
+  if (OB_ISNULL(expr)) {
+    return ret;
+  }
+  if (expr->is_column_ref_expr()) {
+    ObColumnRefRawExpr *column_ref = static_cast<ObColumnRefRawExpr *>(expr);
+    const uint64_t table_id = column_ref->get_table_id();
+    const uint64_t column_id = column_ref->get_column_id();
+    if (OB_INVALID_ID != table_id && OB_INVALID_ID != column_id) {
+      bool is_found = false;
+      for (int64_t i = 0; !is_found && i < table_ids.count(); ++i) {
+        is_found = (table_ids.at(i) == table_id && column_ids.at(i) == column_id);
+      }
+      if (!is_found) {
+        if (OB_FAIL(table_ids.push_back(table_id))) {
+        } else if (OB_FAIL(column_ids.push_back(column_id))) {
+        }
+      }
+    }
+  }
+  const int64_t param_count = expr->get_param_count();
+  for (int64_t i = 0; OB_SUCC(ret) && i < param_count; ++i) {
+    ObRawExpr *param_expr = expr->get_param_expr(i);
+    if (OB_SUCC(ret)
+        && OB_FAIL(collect_ai_columns_of_expr(schema_checker, param_expr, table_ids, column_ids))) {
+    }
+  }
+  return ret;
+}
+
+/* whether the expression references the column of the given name */
+bool expr_references_column(ObRawExpr *expr, const common::ObString &column_name)
+{
+  bool found = false;
+  if (NULL != expr) {
+    if (expr->is_column_ref_expr()) {
+      ObColumnRefRawExpr *column_ref = static_cast<ObColumnRefRawExpr *>(expr);
+      found = common::ObCharset::case_insensitive_equal(column_ref->get_column_name(), column_name);
+    }
+    for (int64_t i = 0; !found && i < expr->get_param_count(); ++i) {
+      found = expr_references_column(expr->get_param_expr(i), column_name);
+    }
+  }
+  return found;
+}
+
+} // namespace
+
+int ObSelectResolver::collect_ai_columns(ObSchemaChecker *schema_checker,
+                                          common::ObIAllocator &allocator,
+                                          const common::ObIArray<ObRawExpr *> &exprs,
+                                          common::ObSEArray<uint64_t, 8> &table_ids,
+                                          common::ObSEArray<uint64_t, 8> &column_ids)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(allocator);
+  if (OB_ISNULL(schema_checker)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < exprs.count(); ++i) {
+      if (OB_SUCC(ret)
+          && OB_FAIL(collect_ai_columns_of_expr(schema_checker, exprs.at(i), table_ids, column_ids))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSelectResolver::check_ai_column_ready(ObSQLSessionInfo *session_info,
+                                             ObSchemaChecker *schema_checker,
+                                             common::ObIAllocator &allocator,
+                                             const uint64_t table_id,
+                                             const uint64_t column_id)
+{
+  int ret = OB_SUCCESS;
+  const share::schema::ObTableSchema *table_schema = NULL;
+  const share::schema::ObDatabaseSchema *database_schema = NULL;
+  const share::schema::ObColumnSchemaV2 *column_schema = NULL;
+  common::ObSqlString buf;
+  common::ObString sql;
+  if (OB_ISNULL(session_info) || OB_ISNULL(schema_checker)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_checker->get_table_schema(table_id, table_schema))) {
+    LOG_WARN("failed to get the schema of the table of the ai column", K(ret));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_SCHEMA_ERROR;
+  } else if (OB_FAIL(schema_checker->get_database_schema(table_schema->get_database_id(),
+                                                         database_schema))) {
+    LOG_WARN("failed to get the schema of the database of the ai column", K(ret));
+  } else if (OB_ISNULL(database_schema)) {
+    ret = OB_SCHEMA_ERROR;
+  } else if (OB_FAIL(schema_checker->get_column_schema(table_id, column_id, column_schema))) {
+    LOG_WARN("failed to get the schema of the ai column", K(ret));
+  } else if (OB_ISNULL(column_schema)) {
+    ret = OB_SCHEMA_ERROR;
+  } else if (OB_FAIL(buf.append("select (select count(*) from (select 1 from `"))) {
+  } else if (OB_FAIL(buf.append(database_schema->get_database_name_str()))) {
+  } else if (OB_FAIL(buf.append("`.`"))) {
+  } else if (OB_FAIL(buf.append(table_schema->get_table_name_str()))) {
+  } else if (OB_FAIL(buf.append("` where `"))) {
+  } else if (OB_FAIL(buf.append(column_schema->get_column_name_str()))) {
+  } else if (OB_FAIL(buf.append("` is null limit 1) `__ai_not_ready`) "))) {
+  } else if (OB_FAIL(buf.append("+ (select count(*) from oceanbase.`__all_ai_column_task` "))) {
+  } else if (OB_FAIL(buf.append("where `table_id` = "))) {
+  } else if (OB_FAIL(buf.append_fmt("%ld", static_cast<long>(table_id)))) {
+  } else if (OB_FAIL(buf.append(" and `column_id` = "))) {
+  } else if (OB_FAIL(buf.append_fmt("%ld", static_cast<long>(column_id)))) {
+  } else if (OB_FAIL(buf.append(")"))) {
+  } else {
+    sql.assign_ptr(buf.ptr(), buf.length());
+    /* the check statement reads the ai column itself, so the strict read is
+     * disabled while it runs, otherwise the statement would check itself */
+    ObBasicSysVar *sys_var = NULL;
+    common::ObObj old_value;
+    bool is_var_changed = false;
+    int64_t not_ready = 0;
+    common::sqlclient::ObISQLConnectionGuard conn_guard;
+    common::sqlclient::ObISQLConnection *conn = NULL;
+    if (OB_SUCC(session_info->get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ, sys_var))
+        && OB_NOT_NULL(sys_var)) {
+      old_value = sys_var->get_value();
+      common::ObObj new_value;
+      new_value.set_int(0);
+      sys_var->set_value(new_value);
+      is_var_changed = true;
+    }
+    if (OB_SUCC(ret)
+        && OB_FAIL(query::ObInnerSQLConnectionAccess::
+                       create_connection_with_external_session(session_info, conn_guard))) {
+      LOG_WARN("failed to create the inner sql connection of the strict read", K(ret));
+    } else if (OB_SUCC(ret) && OB_ISNULL(conn = conn_guard.get_ptr())) {
+      ret = OB_INNER_STAT_ERROR;
+    } else if (OB_SUCC(ret)) {
+      /* the check statement runs in the session of the statement which is
+       * resolved, so the state of the session is saved and restored */
+      ObIInnerSQLConnection *inner_conn = as_inner_sql_connection(conn);
+      ObSQLSessionInfo::StmtSavedValue saved_session;
+      ObIInnerSQLConnection::SavedValue saved_conn;
+      bool is_nested = false;
+      common::ObISQLClient::ReadResult res;
+      if (OB_NOT_NULL(inner_conn)
+          && OB_SUCC(inner_conn->begin_nested_session(saved_session, saved_conn, false))) {
+        is_nested = true;
+      }
+      /* the nested execution may report an internal error after the statement has
+       * been executed, the result is still usable */
+      const int read_ret = conn->execute_read(sql, res);
+      if (OB_SUCCESS != read_ret && OB_ERR_UNEXPECTED != read_ret) {
+        ret = read_ret;
+        LOG_WARN("failed to run the strict read statement", K(read_ret));
+      } else {
+        common::sqlclient::ObMySQLResult *result = res.get_result();
+        if (OB_ISNULL(result)) {
+          ret = (OB_SUCCESS == read_ret) ? static_cast<int>(OB_ERR_UNEXPECTED) : read_ret;
+        } else if (OB_FAIL(result->next())) {
+          LOG_WARN("failed to read the result of the strict read statement", K(ret));
+        } else if (OB_FAIL(result->get_int(static_cast<int64_t>(0), not_ready))) {
+          LOG_WARN("failed to read the count of the strict read statement", K(ret));
+        }
+      }
+      if (is_nested) {
+        const int end_ret = inner_conn->end_nested_session(saved_session, saved_conn);
+        if (OB_SUCC(ret) && OB_SUCCESS != end_ret) {
+          ret = end_ret;
+        }
+      }
+    }
+    if (is_var_changed) {
+      sys_var->set_value(old_value);
+    }
+    if (OB_SUCC(ret) && not_ready > 0) {
+      ret = OB_AI_COLUMN_NOT_READY;
+      LOG_USER_ERROR(OB_AI_COLUMN_NOT_READY,
+                     static_cast<long>(table_id), static_cast<long>(column_id));
+    }
+  }
+  return ret;
+}
+
+int ObSelectResolver::check_ai_column_strict_read(ObSQLSessionInfo *session_info,
+                                                   ObSchemaChecker *schema_checker,
+                                                   common::ObIAllocator &allocator,
+                                                   const common::ObIArray<ObRawExpr *> &exprs)
+{
+  int ret = OB_SUCCESS;
+  int64_t is_strict_read = 0;
+  common::ObSEArray<uint64_t, 8> table_ids;
+  common::ObSEArray<uint64_t, 8> column_ids;
+  if (OB_ISNULL(session_info) || OB_ISNULL(schema_checker)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session_info->get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ,
+                                                     is_strict_read))) {
+    ret = OB_SUCCESS;
+    /* the system variable is not available, the strict read is disabled */
+  } else if (0 == is_strict_read) {
+    /* the strict read is disabled */
+  } else if (OB_FAIL(collect_ai_columns(schema_checker, allocator, exprs, table_ids, column_ids))) {
+    LOG_WARN("failed to collect the ai columns of the statement", K(ret));
+  } else {
+    /* only the columns which are AI columns of their table are checked */
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_ids.count(); ++i) {
+      const share::schema::ObTableSchema *table_schema = NULL;
+      const share::schema::ObColumnSchemaV2 *column_schema = NULL;
+      if (OB_FAIL(schema_checker->get_table_schema(table_ids.at(i), table_schema))) {
+        /* the table of the expression is not a base table */
+        ret = OB_SUCCESS;
+      } else if (OB_ISNULL(table_schema)) {
+        /* the table of the expression is not a real table */
+      } else if (OB_ISNULL(column_schema = table_schema->get_column_schema(column_ids.at(i)))) {
+        /* the column of the expression is not a column of the table */
+      } else if (!is_ai_column(*column_schema)) {
+        /* the column is not an AI column */
+      } else if (OB_FAIL(check_ai_column_ready(session_info,
+                                               schema_checker,
+                                               allocator,
+                                               table_ids.at(i),
+                                               column_ids.at(i)))) {
+        LOG_WARN("failed to check the state of the ai column", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSelectResolver::check_ai_column_strict_read_of_select(ObSQLSessionInfo *session_info,
+                                                             ObSchemaChecker *schema_checker,
+                                                             common::ObIAllocator &allocator,
+                                                             ObSelectStmt *select_stmt)
+{
+  int ret = OB_SUCCESS;
+  int64_t is_strict_read = 0;
+  common::ObSEArray<ObRawExpr *, 16> exprs;
+  if (OB_ISNULL(select_stmt) || OB_ISNULL(session_info) || OB_ISNULL(schema_checker)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session_info->get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ,
+                                                     is_strict_read))) {
+    ret = OB_SUCCESS;
+    /* the system variable is not available, the strict read is disabled */
+  } else if (0 == is_strict_read) {
+    /* the strict read is disabled */
+  } else {
+    /* the expressions which the statement reads */
+    const common::ObIArray<SelectItem> &select_items = select_stmt->get_select_items();
+    for (int64_t i = 0; OB_SUCC(ret) && i < select_items.count(); ++i) {
+      if (OB_FAIL(exprs.push_back(select_items.at(i).expr_))) {
+      }
+    }
+    const common::ObIArray<ObRawExpr *> &conditions = select_stmt->get_condition_exprs();
+    for (int64_t i = 0; OB_SUCC(ret) && i < conditions.count(); ++i) {
+      if (OB_FAIL(exprs.push_back(conditions.at(i)))) {
+      }
+    }
+    const common::ObIArray<ObRawExpr *> &having_exprs = select_stmt->get_having_exprs();
+    for (int64_t i = 0; OB_SUCC(ret) && i < having_exprs.count(); ++i) {
+      if (OB_FAIL(exprs.push_back(having_exprs.at(i)))) {
+      }
+    }
+    /* only the AI columns which the statement references are checked, the table
+     * of a table item is not resolved in the raw expressions of the statement,
+     * so the AI columns are matched by the name of the column */
+    for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_table_size(); ++i) {
+      TableItem *table_item = select_stmt->get_table_item(i);
+      const share::schema::ObTableSchema *table_schema = NULL;
+      uint64_t table_id = common::OB_INVALID_ID;
+      if (NULL == table_item) {
+        continue;
+      }
+      table_id = static_cast<int64_t>(table_item->table_id_) > 0
+                 ? table_item->table_id_ : table_item->ref_id_;
+      if (OB_INVALID_ID == table_id) {
+        continue;
+      } else if (OB_FAIL(schema_checker->get_table_schema(table_id, table_schema))) {
+        /* the table of the table item is not a base table */
+        ret = OB_SUCCESS;
+      } else if (NULL == table_schema) {
+        /* the table does not exist anymore */
+      } else {
+        for (int64_t c = 0; OB_SUCC(ret) && c < table_schema->get_column_count(); ++c) {
+          const share::schema::ObColumnSchemaV2 *column_schema =
+              table_schema->get_column_schema_by_idx(c);
+          bool referenced = false;
+          if (NULL == column_schema || column_schema->is_hidden()
+              || !is_ai_column(*column_schema)) {
+            continue;
+          }
+          for (int64_t e = 0; !referenced && e < exprs.count(); ++e) {
+            referenced = expr_references_column(exprs.at(e), column_schema->get_column_name_str());
+          }
+          if (referenced
+              && OB_FAIL(check_ai_column_ready(session_info, schema_checker, allocator,
+                                               table_id, column_schema->get_column_id()))) {
+            LOG_WARN("failed to check the state of the ai column", K(ret));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSelectResolver::check_ai_column_strict_read_of_dml(ObSQLSessionInfo *session_info,
+                                                          ObSchemaChecker *schema_checker,
+                                                          common::ObIAllocator &allocator,
+                                                          ObDMLStmt *stmt,
+                                                          const common::ObIArray<ObRawExpr *> &exprs)
+{
+  int ret = OB_SUCCESS;
+  int64_t is_strict_read = 0;
+  if (OB_ISNULL(stmt) || OB_ISNULL(session_info) || OB_ISNULL(schema_checker)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session_info->get_sys_variable(share::SYS_VAR_AI_COLUMN_STRICT_READ,
+                                                     is_strict_read))) {
+    ret = OB_SUCCESS;
+    /* the system variable is not available, the strict read is disabled */
+  } else if (0 == is_strict_read) {
+    /* the strict read is disabled */
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < stmt->get_table_size(); ++i) {
+      TableItem *table_item = stmt->get_table_item(i);
+      const share::schema::ObTableSchema *table_schema = NULL;
+      uint64_t table_id = common::OB_INVALID_ID;
+      if (NULL == table_item) {
+        continue;
+      }
+      table_id = static_cast<int64_t>(table_item->table_id_) > 0
+                 ? table_item->table_id_ : table_item->ref_id_;
+      if (OB_INVALID_ID == table_id) {
+        continue;
+      } else if (OB_FAIL(schema_checker->get_table_schema(table_id, table_schema))) {
+        /* the table of the table item is not a base table */
+        ret = OB_SUCCESS;
+      } else if (NULL == table_schema) {
+        /* the table does not exist anymore */
+      } else {
+        for (int64_t c = 0; OB_SUCC(ret) && c < table_schema->get_column_count(); ++c) {
+          const share::schema::ObColumnSchemaV2 *column_schema =
+              table_schema->get_column_schema_by_idx(c);
+          bool referenced = false;
+          if (NULL == column_schema || column_schema->is_hidden()
+              || !is_ai_column(*column_schema)) {
+            continue;
+          }
+          for (int64_t e = 0; !referenced && e < exprs.count(); ++e) {
+            referenced = expr_references_column(exprs.at(e), column_schema->get_column_name_str());
+          }
+          if (referenced
+              && OB_FAIL(check_ai_column_ready(session_info, schema_checker, allocator,
+                                               table_id, column_schema->get_column_id()))) {
+            LOG_WARN("failed to check the state of the ai column", K(ret));
+          }
+        }
+      }
     }
   }
   return ret;

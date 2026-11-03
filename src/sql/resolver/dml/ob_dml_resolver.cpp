@@ -18,6 +18,7 @@
 #include "config_bridge.h"
 #include "ob_dml_resolver.h"
 #include "sql/resolver/dml/ob_view_table_resolver.h"
+#include "sql/resolver/dml/ob_file_table_resolver.h"
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/resolver/dml/ob_default_value_utils.h"
 #include "share/schema/ob_part_mgr_util.h"
@@ -2724,6 +2725,17 @@ int ObDMLResolver::resolve_table(const ParseNode &parse_tree,
         }
         break;
       }
+      case T_FILE_TABLE_EXPRESSION: {
+        // a file table function, e.g. read_csv('/path/a.csv')
+        ObFileTableResolver::ResolveContext file_table_ctx;
+        file_table_ctx.allocator_ = allocator_;
+        file_table_ctx.session_info_ = session_info_;
+        file_table_ctx.params_ = &params_;
+        file_table_ctx.stmt_ = get_stmt();
+        file_table_ctx.table_id_ = generate_table_id();
+        OZ (ObFileTableResolver::resolve_file_table_item(file_table_ctx, *table_node, table_item));
+        break;
+      }
       default:
         /* won't be here */
         ret = OB_ERR_PARSER_SYNTAX;
@@ -3084,6 +3096,10 @@ int ObDMLResolver::resolve_single_table_column_item(const TableItem &table_item,
     if (OB_FAIL(resolve_json_table_column_item(table_item, column_name, col_item))) {
     }
   } else if (table_item.is_values_table()) {
+    if (OB_ISNULL(col_item = stmt->get_column_item(table_item.table_id_, column_name))) {
+      ret = OB_ERR_BAD_FIELD_ERROR;
+    }
+  } else if (TableItem::FILE_TABLE == table_item.type_) {
     if (OB_ISNULL(col_item = stmt->get_column_item(table_item.table_id_, column_name))) {
       ret = OB_ERR_BAD_FIELD_ERROR;
     }

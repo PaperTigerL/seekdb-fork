@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "ob_column_namespace_checker.h"
 #include "sql/resolver/dml/ob_dml_resolver.h"
+#include "sql/resolver/dml/ob_file_table_resolver.h"
 
 namespace oceanbase
 {
@@ -339,6 +340,12 @@ int ObColumnNamespaceChecker::check_column_exists(const TableItem &table_item, c
         }
       }
     }
+  } else if (TableItem::FILE_TABLE == table_item.type_) {
+    if (OB_FAIL(ObFileTableResolver::check_file_table_column_exists(table_item,
+                                                                   dml_stmt_,
+                                                                   col_name,
+                                                                   is_exist))) {
+    } else { /*do nothing*/ }
   } else {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected table type", K_(table_item.type));

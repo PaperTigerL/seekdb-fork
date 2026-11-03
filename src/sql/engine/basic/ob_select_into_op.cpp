@@ -38,7 +38,7 @@ OB_SERIALIZE_MEMBER(ObSelectIntoOpInput, task_id_, sqc_id_);
 OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfile_name_,
     field_str_, line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, buffer_size_, is_overwrite_,
-    external_properties_);
+    external_properties_, write_header_, null_str_, column_names_);
 
 
 int ObSelectIntoOp::inner_open()
@@ -60,6 +60,8 @@ int ObSelectIntoOp::inner_open()
       format_type_ = external_properties_.format_type_;
     }
   }
+  /* the null value is written as the given text, the default '\N' is used when it is empty */
+  null_str_ = MY_SPEC.null_str_;
   if (OB_SUCC(ret)) {
     switch (format_type_)
     {
@@ -200,6 +202,12 @@ int ObSelectIntoOp::inner_get_next_row()
       && T_INTO_VARIABLES != into_type
       && OB_FAIL(create_the_only_data_writer(data_writer))) {
   }
+  if (OB_SUCC(ret) && ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_
+      && T_INTO_OUTFILE == into_type && MY_SPEC.write_header_ && !header_written_) {
+    /* the names of the output columns are written before the first row of the data */
+    if (OB_FAIL(write_header(data_writer))) {
+    }
+  }
   while (OB_SUCC(ret) && row_count < top_limit_cnt_) {
     clear_evaluated_flag();
     if (OB_FAIL(child_->get_next_row())) {
@@ -253,6 +261,12 @@ int ObSelectIntoOp::inner_get_next_batch(const int64_t max_row_cnt)
     if (OB_FAIL(create_the_only_data_writer(data_writer))) {
     } else if (OB_ISNULL(data_writer)) {
       ret = OB_ERR_UNEXPECTED;
+    }
+  }
+  if (OB_SUCC(ret) && ObExternalFileFormat::FormatType::CSV_FORMAT == format_type_
+      && T_INTO_OUTFILE == into_type && MY_SPEC.write_header_ && !header_written_) {
+    /* the names of the output columns are written before the first row of the data */
+    if (OB_FAIL(write_header(data_writer))) {
     }
   }
 
@@ -917,6 +931,52 @@ int ObSelectIntoOp::print_lob_field(const ObObj &obj,
   return ret;
 }
 
+int ObSelectIntoOp::write_null_str_to_file(ObCsvFileWriter &data_writer)
+{
+  int ret = OB_SUCCESS;
+  ObObj obj;
+  obj.set_varchar(null_str_);
+  obj.set_collation_type(cs_type_);
+  /* the null text is written as it is, it is not escaped */
+  ret = write_obj_to_file(obj, data_writer, false);
+  return ret;
+}
+
+int ObSelectIntoOp::write_header(ObExternalFileWriter *data_writer)
+{
+  int ret = OB_SUCCESS;
+  ObCsvFileWriter *csv_data_writer = static_cast<ObCsvFileWriter *>(data_writer);
+  const common::ObIArray<common::ObString> &column_names = MY_SPEC.column_names_;
+  if (OB_ISNULL(csv_data_writer)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("the data writer of select into is not a csv writer", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < column_names.count(); ++i) {
+      ObObj obj;
+      obj.set_varchar(column_names.at(i));
+      obj.set_collation_type(cs_type_);
+      if (OB_FAIL(print_field(obj, *csv_data_writer))) {
+      } else if (i != column_names.count() - 1) {
+        /* print field terminator */
+        OZ(write_obj_to_file(field_str_, *csv_data_writer));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      /* print line terminator */
+      OZ(write_obj_to_file(line_str_, *csv_data_writer));
+      /* check if need split file */
+      OZ(check_csv_file_size(*csv_data_writer));
+      /* clear shared buffer */
+      OZ(csv_data_writer->flush_shared_buf(shared_buf_));
+      if (has_compress_) {
+        OZ(csv_data_writer->flush_buf());
+      }
+      header_written_ = true;
+    }
+  }
+  return ret;
+}
+
 int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
 {
   int ret = OB_SUCCESS;
@@ -932,8 +992,13 @@ int ObSelectIntoOp::print_field(const ObObj &obj, ObCsvFileWriter &data_writer)
   if (!has_escape_) {
     OZ(write_obj_to_file(obj, data_writer, false));
   } else if (obj.is_null()) {
-    OZ(write_single_char_to_file(&char_escape_, data_writer));
-    OZ(write_single_char_to_file(&char_n, data_writer));
+    if (!null_str_.empty()) {
+      /* the null value is written as the given text */
+      OZ(write_null_str_to_file(data_writer));
+    } else {
+      OZ(write_single_char_to_file(&char_escape_, data_writer));
+      OZ(write_single_char_to_file(&char_n, data_writer));
+    }
   } else {
     OZ(write_obj_to_file(obj, data_writer, true));
   }

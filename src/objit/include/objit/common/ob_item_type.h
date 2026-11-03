@@ -2274,6 +2274,19 @@ typedef enum ObItemType
   T_FORK_DATABASE = 4917,
   T_DIFF_TABLE = 4918,
   T_MERGE_TABLE = 4919,
+  T_FLUSH_PRIVILEGES = 4920,
+  // AI column (async AI generated column)
+  T_AI_COLUMN_ATTR = 4921,
+  T_AI_COLUMN_PARAMS = 4922,
+  T_AI_COLUMN_PARAM = 4923,
+  T_RETRY_AI_COLUMN = 4924,
+  // file as database (read_csv/read_json/read_parquet/glob table function)
+  T_FILE_TABLE_EXPRESSION = 4925,
+  T_FILE_TABLE_ARG = 4926,
+  // describe select ... / copy (select ...) to 'file' (options)
+  T_DESCRIBE_SELECT = 4927,
+  T_COPY_TO_FILE = 4928,
+  T_COPY_TO_OPTION = 4929,
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;
 

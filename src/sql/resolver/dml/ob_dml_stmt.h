@@ -17,6 +17,7 @@
 #ifndef OCEANBASE_SQL_STMT_H_
 #define OCEANBASE_SQL_STMT_H_
 #include "data_plane/access/ob_tablet_scan.h"
+#include "sql/resolver/dml/ob_file_table_def.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
 #include "lib/string/ob_string.h"
 #include "lib/utility/ob_mod_define.h"
@@ -155,6 +156,7 @@ struct TableItem
     json_table_def_ = nullptr;
     table_type_ = MAX_TABLE_TYPE;
     values_table_def_ = NULL;
+    file_table_def_ = NULL;
     sample_info_ = nullptr;
   }
 
@@ -190,6 +192,7 @@ struct TableItem
     JSON_TABLE,
     VALUES_TABLE,
     LATERAL_TABLE,
+    FILE_TABLE,
   };
 
   /**
@@ -303,6 +306,8 @@ struct TableItem
   ObJsonTableDef *json_table_def_;
   // values table
   ObValuesTableDef *values_table_def_;
+  // file table (read_csv / read_json / read_parquet / glob table functions)
+  ObFileTableDef *file_table_def_;
   // sample scan infos
   SampleInfo *sample_info_;
 };

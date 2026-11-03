@@ -3032,7 +3032,8 @@ int ObLogicalOperator::project_pruning_pre()
   // but not used by it's parent's output_exprs_
   if (NULL != parent_ && !is_plan_root() &&
       LOG_EXPR_VALUES != type_ &&
-      LOG_VALUES_TABLE_ACCESS != type_) {
+      LOG_VALUES_TABLE_ACCESS != type_ &&
+      LOG_FILE_TABLE_ACCESS != type_) {
     PPDeps deps;
     if (OB_FAIL(parent_->check_output_dependance(get_output_exprs(), deps))) {
     } else {
