@@ -20,6 +20,7 @@
 #include "sql/das/iter/ob_das_iter.h"
 #include "sql/das/ob_das_ir_define.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_tr_merge_iter.h"
+#include "storage/fts/ob_fts_result_cache.h"
 #include "storage/retrieval/ob_i_sparse_retrieval_iter.h"
 #include "storage/retrieval/ob_text_daat_iter.h"
 #include "storage/retrieval/ob_text_taat_iter.h"
@@ -82,7 +83,18 @@ public:
   int set_children_iter_rangekey(const common::ObIArray<std::pair<ObDocIdExt, int>> &virtual_rangekeys, const int64_t batch_size);
   bool is_taat_mode() { return taat_mode_; }
   int get_query_max_score(double &score) {
-    return sparse_retrieval_iter_->get_query_max_score(score);
+    int ret = OB_SUCCESS;
+    if (OB_NOT_NULL(cached_result_)) {
+      score = cached_result_->max_score_;
+      if (score <= 0.0) {
+        ret = OB_ERR_UNEXPECTED;
+      }
+    } else if (OB_ISNULL(sparse_retrieval_iter_)) {
+      ret = OB_NOT_INIT;
+    } else {
+      ret = sparse_retrieval_iter_->get_query_max_score(score);
+    }
+    return ret;
   }
 private:
   int init_das_iter_scan_params();
@@ -108,6 +120,12 @@ private:
   int init_topk_limit();
   int init_block_max_iter_param();
   int init_doc_length_est_param();
+  int prepare_result_cache();
+  int replay_cached_rows(const int64_t capacity, int64_t &count);
+  int replay_cached_row();
+  int capture_cached_rows(const int64_t count);
+  void finish_result_cache();
+  void finish_partial_result_cache();
 private:
   static const int64_t INV_IDX_ROWKEY_COL_CNT = 2;
 private:
@@ -149,6 +167,13 @@ private:
   bool check_rangekey_inited_;
   bool inv_idx_tablet_switched_;
   bool is_inited_;
+  // cross-statement result cache for unfiltered doc-id scans
+  std::string result_cache_key_;
+  std::shared_ptr<const storage::ObFtsCachedResult> cached_result_;
+  std::shared_ptr<storage::ObFtsCachedResult> cache_fill_;
+  int64_t cached_row_pos_;
+  uint64_t cache_generation_;
+  bool result_cacheable_;
   DISALLOW_COPY_AND_ASSIGN(ObDASLegacyTRMergeIter);
 };
 

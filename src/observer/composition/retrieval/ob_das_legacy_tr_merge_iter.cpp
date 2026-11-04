@@ -55,7 +55,13 @@ ObDASLegacyTRMergeIter::ObDASLegacyTRMergeIter()
     flags_(0),
     check_rangekey_inited_(false),
     inv_idx_tablet_switched_(false),
-    is_inited_(false)
+    is_inited_(false),
+    result_cache_key_(),
+    cached_result_(),
+    cache_fill_(),
+    cached_row_pos_(0),
+    cache_generation_(0),
+    result_cacheable_(false)
 {
 }
 
@@ -703,17 +709,86 @@ int ObDASLegacyTRMergeIter::do_table_scan()
   } else {
     if (function_lookup_mode_) {
       // skip the following, which should have been done
+    } else if (OB_FAIL(prepare_result_cache())) {
+    } else if (OB_NOT_NULL(cached_result_)) {
+      // fully served from the result cache; no storage iterator is opened
+      cached_row_pos_ = 0;
     } else if (OB_FAIL(init_das_iter_scan_params())) {
     } else if (OB_FAIL(create_dim_iters())) {
     } else if (OB_FAIL(create_sparse_retrieval_iter())) {
     } else if (OB_FAIL(set_children_iter_rangekey())) {
     }
     if (OB_FAIL(ret)) {
-    } else if (OB_UNLIKELY(!check_rangekey_inited_)) {
+    } else if (OB_ISNULL(cached_result_) && OB_UNLIKELY(!check_rangekey_inited_)) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (OB_ISNULL(cached_result_)) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
+        if (OB_FAIL(children_[i]->do_table_scan())) {
+        }
+      }
     }
-    for (int64_t i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
-      if (OB_FAIL(children_[i]->do_table_scan())) {
+  }
+  return ret;
+}
+
+int ObDASLegacyTRMergeIter::prepare_result_cache()
+{
+  int ret = OB_SUCCESS;
+  result_cacheable_ = false;
+  result_cache_key_.clear();
+  cached_result_.reset();
+  cache_fill_.reset();
+  cached_row_pos_ = 0;
+  if (!function_lookup_mode_
+      && OB_NOT_NULL(ir_ctdef_) && OB_NOT_NULL(ir_rtdef_)
+      && OB_NOT_NULL(ir_rtdef_->eval_ctx_)
+      && inv_idx_tablet_id_.is_valid()
+      && query_tokens_.count() > 0
+      && OB_ISNULL(ir_ctdef_->field_boost_expr_)
+      && OB_NOT_NULL(ir_ctdef_->inv_scan_domain_id_col_)) {
+    const common::ObLimitParam *limit_param =
+        &ir_rtdef_->get_inv_idx_scan_rtdef()->limit_param_;
+    const uint64_t generation = storage::ObFtsContentVersion::instance().get();
+    const int64_t tablet_id = inv_idx_tablet_id_.id();
+    const uint64_t mode = static_cast<uint64_t>(flags_);
+    const int64_t limit = limit_param->is_valid() ? limit_param->limit_ : -1;
+    const int64_t offset = limit_param->is_valid() ? limit_param->offset_ : -1;
+    // the plan identity pins the match filter and relevance projection
+    const int64_t plan_id = reinterpret_cast<int64_t>(ir_ctdef_);
+    const int64_t topk_limit = topk_limit_;
+    const int64_t id_type =
+        static_cast<int64_t>(ir_ctdef_->inv_scan_domain_id_col_->datum_meta_.type_);
+    const int64_t token_cnt = query_tokens_.count();
+    result_cache_key_.reserve(128);
+    result_cache_key_.append(reinterpret_cast<const char *>(&tablet_id), sizeof(tablet_id));
+    result_cache_key_.append(reinterpret_cast<const char *>(&generation), sizeof(generation));
+    result_cache_key_.append(reinterpret_cast<const char *>(&mode), sizeof(mode));
+    result_cache_key_.append(reinterpret_cast<const char *>(&limit), sizeof(limit));
+    result_cache_key_.append(reinterpret_cast<const char *>(&offset), sizeof(offset));
+    result_cache_key_.append(reinterpret_cast<const char *>(&plan_id), sizeof(plan_id));
+    result_cache_key_.append(reinterpret_cast<const char *>(&topk_limit), sizeof(topk_limit));
+    result_cache_key_.append(reinterpret_cast<const char *>(&id_type), sizeof(id_type));
+    result_cache_key_.append(reinterpret_cast<const char *>(&token_cnt), sizeof(token_cnt));
+    for (int64_t i = 0; OB_SUCC(ret) && i < token_cnt; ++i) {
+      const int64_t len = query_tokens_.at(i).length();
+      result_cache_key_.append(reinterpret_cast<const char *>(&len), sizeof(len));
+      if (len > 0) {
+        result_cache_key_.append(query_tokens_.at(i).ptr(), static_cast<size_t>(len));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      result_cacheable_ = true;
+      cache_generation_ = generation;
+      sr_iter_param_.eval_ctx_ = ir_rtdef_->eval_ctx_;
+      sr_iter_param_.id_proj_expr_ = ir_ctdef_->inv_scan_domain_id_col_;
+      sr_iter_param_.relevance_proj_expr_ = ir_ctdef_->relevance_proj_col_;
+      sr_iter_param_.limit_param_ = limit_param;
+      std::shared_ptr<const storage::ObFtsCachedResult> cached;
+      if (storage::ObFtsResultCache::instance().get(result_cache_key_, cached)) {
+        cached_result_ = cached;
+        cached_row_pos_ = 0;
+        LOG_INFO("fts result cache hit", K(result_cache_key_.size()),
+                 K(cached_result_->rows_.size()), K(inv_idx_tablet_id_));
       }
     }
   }
@@ -739,6 +814,11 @@ int ObDASLegacyTRMergeIter::inner_reuse()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_NOT_NULL(cached_result_)) {
+    cached_row_pos_ = 0;
+    if (OB_NOT_NULL(mem_context_)) {
+      mem_context_->reset_remain_one_page();
+    }
   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (query_tokens_.count() > 0) {
@@ -764,7 +844,7 @@ int ObDASLegacyTRMergeIter::inner_reuse()
     }
   }
 
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret) && OB_NOT_NULL(sparse_retrieval_iter_)) {
     sparse_retrieval_iter_->reuse(inv_idx_tablet_switched_);
     inv_idx_tablet_switched_ = false;
   }
@@ -772,6 +852,8 @@ int ObDASLegacyTRMergeIter::inner_reuse()
   if (OB_NOT_NULL(mem_context_)) {
     mem_context_->reset_remain_one_page();
   }
+  finish_partial_result_cache();
+  cached_row_pos_ = 0;
   check_rangekey_inited_ = false;
   return ret;
 }
@@ -781,6 +863,8 @@ int ObDASLegacyTRMergeIter::rescan()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_NOT_NULL(cached_result_)) {
+    cached_row_pos_ = 0;
   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (!function_lookup_mode_ && OB_FAIL(set_children_iter_rangekey())) {
@@ -844,6 +928,11 @@ int ObDASLegacyTRMergeIter::inner_release()
   }
   dim_iters_.reset();
   dim_iter_ = nullptr;
+  result_cache_key_.clear();
+  cached_result_.reset();
+  finish_partial_result_cache();
+  cached_row_pos_ = 0;
+  result_cacheable_ = false;
   if (nullptr != mem_context_) {
     mem_context_->reset_remain_one_page();
     DESTROY_CONTEXT(mem_context_);
@@ -867,10 +956,15 @@ int ObDASLegacyTRMergeIter::inner_get_next_row()
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_NOT_NULL(cached_result_)) {
+    ret = replay_cached_row();
   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
     ret = OB_ERR_UNEXPECTED;
-  } else {
-    ret = sparse_retrieval_iter_->get_next_row();
+  } else if (OB_FAIL(sparse_retrieval_iter_->get_next_row())) {
+    if (OB_ITER_END == ret) {
+      finish_result_cache();
+    }
+  } else if (OB_FAIL(capture_cached_rows(1))) {
   }
   return ret;
 }
@@ -880,14 +974,184 @@ int ObDASLegacyTRMergeIter::inner_get_next_rows(int64_t &count, int64_t capacity
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
+  } else if (OB_NOT_NULL(cached_result_)) {
+    ret = replay_cached_rows(capacity, count);
   } else if (OB_ISNULL(sparse_retrieval_iter_)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_UNLIKELY(0 == capacity)) {
     count = 0;
   } else {
     ret = sparse_retrieval_iter_->get_next_rows(capacity, count);
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(capture_cached_rows(count))) {
+      }
+    } else if (OB_ITER_END == ret) {
+      finish_result_cache();
+    }
   }
   return ret;
+}
+
+int ObDASLegacyTRMergeIter::replay_cached_rows(const int64_t capacity, int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  count = 0;
+  ObExpr *id_expr = sr_iter_param_.id_proj_expr_;
+  ObExpr *relevance_expr = sr_iter_param_.relevance_proj_expr_;
+  ObEvalCtx *eval_ctx = sr_iter_param_.eval_ctx_;
+  if (OB_ISNULL(cached_result_) || OB_ISNULL(id_expr) || OB_ISNULL(eval_ctx)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const std::vector<storage::ObFtsCachedRow> &rows = cached_result_->rows_;
+    const int64_t total = static_cast<int64_t>(rows.size());
+    if (cached_row_pos_ >= total) {
+      ret = OB_ITER_END;
+    } else {
+      const int64_t out_cnt = MIN(capacity, total - cached_row_pos_);
+      ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
+      if (eval_ctx->is_vectorized()) {
+        sql::ObBitVector &id_flags = id_expr->get_evaluated_flags(*eval_ctx);
+        sql::ObBitVector *rel_flags = OB_NOT_NULL(relevance_expr)
+            ? &relevance_expr->get_evaluated_flags(*eval_ctx)
+            : nullptr;
+        for (int64_t i = 0; i < out_cnt; ++i) {
+          const storage::ObFtsCachedRow &row = rows[cached_row_pos_ + i];
+          guard.set_batch_idx(i);
+          ObDatum &id_datum = id_expr->locate_datum_for_write(*eval_ctx);
+          if (row.is_null_) {
+            id_datum.set_null();
+          } else if (row.is_int_) {
+            id_datum.set_int(row.int_value_);
+          } else {
+            id_datum.set_string(row.str_.data(), static_cast<uint32_t>(row.str_.size()));
+          }
+          id_flags.set(i);
+          if (OB_NOT_NULL(relevance_expr)) {
+            ObDatum &rel_datum = relevance_expr->locate_datum_for_write(*eval_ctx);
+            rel_datum.set_double(row.relevance_);
+            rel_flags->set(i);
+          }
+        }
+        id_expr->set_evaluated_projected(*eval_ctx);
+        if (OB_NOT_NULL(relevance_expr)) {
+          relevance_expr->set_evaluated_projected(*eval_ctx);
+        }
+        cached_row_pos_ += out_cnt;
+        count = out_cnt;
+      } else if (OB_UNLIKELY(1 != capacity)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        guard.set_batch_idx(0);
+        const storage::ObFtsCachedRow &row = rows[cached_row_pos_];
+        ObDatum &id_datum = id_expr->locate_datum_for_write(*eval_ctx);
+        if (row.is_null_) {
+          id_datum.set_null();
+        } else if (row.is_int_) {
+          id_datum.set_int(row.int_value_);
+        } else {
+          id_datum.set_string(row.str_.data(), static_cast<uint32_t>(row.str_.size()));
+        }
+        id_expr->set_evaluated_projected(*eval_ctx);
+        if (OB_NOT_NULL(relevance_expr)) {
+          ObDatum &rel_datum = relevance_expr->locate_datum_for_write(*eval_ctx);
+          rel_datum.set_double(row.relevance_);
+          relevance_expr->set_evaluated_projected(*eval_ctx);
+        }
+        ++cached_row_pos_;
+        count = 1;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDASLegacyTRMergeIter::replay_cached_row()
+{
+  int ret = OB_SUCCESS;
+  int64_t count = 0;
+  if (OB_FAIL(replay_cached_rows(1, count))) {
+  } else if (OB_UNLIKELY(1 != count)) {
+    ret = OB_ERR_UNEXPECTED;
+  }
+  return ret;
+}
+
+int ObDASLegacyTRMergeIter::capture_cached_rows(const int64_t count)
+{
+  int ret = OB_SUCCESS;
+  if (result_cacheable_ && count > 0) {
+    ObExpr *id_expr = sr_iter_param_.id_proj_expr_;
+    ObExpr *relevance_expr = sr_iter_param_.relevance_proj_expr_;
+    ObEvalCtx *eval_ctx = sr_iter_param_.eval_ctx_;
+    if (OB_ISNULL(id_expr) || OB_ISNULL(eval_ctx)) {
+      result_cacheable_ = false;
+    } else {
+      if (nullptr == cache_fill_) {
+        cache_fill_ = std::make_shared<storage::ObFtsCachedResult>();
+      }
+      if (nullptr == cache_fill_) {
+        result_cacheable_ = false;
+      } else {
+        std::vector<storage::ObFtsCachedRow> &rows = cache_fill_->rows_;
+        rows.reserve(rows.size() + static_cast<size_t>(count));
+        const bool is_int = (common::ObUInt64Type == id_expr->datum_meta_.type_);
+        for (int64_t i = 0; i < count; ++i) {
+          storage::ObFtsCachedRow row;
+          row.is_int_ = is_int;
+          const ObDatum &id_datum = id_expr->locate_expr_datum(*eval_ctx, i);
+          row.is_null_ = id_datum.is_null();
+          if (!row.is_null_) {
+            if (is_int) {
+              row.int_value_ = id_datum.get_int();
+            } else {
+              const ObString id_str = id_datum.get_string();
+              row.str_.assign(id_str.ptr(), static_cast<size_t>(id_str.length()));
+            }
+          }
+          if (OB_NOT_NULL(relevance_expr)) {
+            row.relevance_ = relevance_expr->locate_expr_datum(*eval_ctx, i).get_double();
+          }
+          rows.push_back(std::move(row));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+void ObDASLegacyTRMergeIter::finish_result_cache()
+{
+  if (result_cacheable_) {
+    if (nullptr == cache_fill_) {
+      cache_fill_ = std::make_shared<storage::ObFtsCachedResult>();
+    }
+    if (nullptr != cache_fill_
+        && storage::ObFtsContentVersion::instance().get() == cache_generation_) {
+      storage::ObFtsResultCache::instance().put(result_cache_key_, cache_fill_);
+      LOG_INFO("fts result cache filled", K(result_cache_key_.size()),
+               K(cache_fill_->rows_.size()), K(inv_idx_tablet_id_));
+    }
+    cache_fill_.reset();
+  }
+}
+
+void ObDASLegacyTRMergeIter::finish_partial_result_cache()
+{
+  // A limit pushed into the scan stops the producer before ITER_END.  The
+  // produced prefix is exactly what that same limited query needs, and the
+  // limit/offset are part of the cache key.
+  if (result_cacheable_ && nullptr != cache_fill_ && nullptr != sr_iter_param_.limit_param_
+      && sr_iter_param_.limit_param_->is_valid()) {
+    const int64_t needed = sr_iter_param_.limit_param_->offset_
+        + sr_iter_param_.limit_param_->limit_;
+    if (static_cast<int64_t>(cache_fill_->rows_.size()) >= needed
+        && storage::ObFtsContentVersion::instance().get() == cache_generation_) {
+      storage::ObFtsResultCache::instance().put(result_cache_key_, cache_fill_);
+      LOG_INFO("fts partial result cache filled", K(cache_fill_->rows_.size()),
+               K(needed), K(inv_idx_tablet_id_));
+    }
+  }
+  cache_fill_.reset();
 }
 
 static int get_query_tokens_by_compacting_repeated_token(ObString &query_str,

@@ -471,29 +471,56 @@ int ObPxMultiPartSSTableInsertOp::write_ordered_slice_by_row()
   data_plane::ObDirectInsertAutoincParam autoinc_param;
   bool need_update_tablet_range_count = true;
 
+  /* the child is a PX exchange; fetch a batch once instead of one row per
+   * call so the per-row channel and scheduling overhead is paid per batch */
+  const int64_t insert_batch_size = 512;
+  const ObBatchRows *child_brs = nullptr;
+  ObEvalCtx::BatchInfoScopeGuard batch_guard(get_eval_ctx());
   while (OB_SUCC(ret) && !is_all_partition_finished_) {
-    if (OB_FAIL(get_next_row_from_child(&op_monitor_info_.otherstat_2_value_))) {
+    child_brs = nullptr;
+    clear_evaluated_flag();
+    if (OB_FAIL(child_->get_next_batch(insert_batch_size, child_brs))) {
       if (OB_ITER_END != ret) {
       } else {
         is_all_partition_finished_ = true;
         ret = OB_SUCCESS;
       }
-    } else if (OB_UNLIKELY(need_update_tablet_range_count)
-               && OB_FAIL(direct_insert_session_->prepare_ordered_input())) {
-    } else if (FALSE_IT(need_update_tablet_range_count = false)) {
-    } else if (OB_FAIL(get_tablet_info_from_row(child_->get_spec().output_, tablet_id, &slice_param))) {
-    } else if (OB_FAIL(switch_slice_if_need(
-                   tablet_id, slice_param.slice_idx_, slice_writer,
-                   &autoinc_param))) {
-    } else if (autoinc_param.enabled_ && FALSE_IT(
-          get_eval_ctx().exec_ctx_.set_ddl_idempotent_autoinc_params(autoinc_param.slice_count_,
-                                                                     autoinc_param.slice_index_,
-                                                                     slice_writer->get_row_count(),
-                                                                     autoinc_param.range_interval_))) {
-    } else if (OB_FAIL(eval_current_row(datums))) {
-    } else if (OB_FAIL(slice_writer->append_row(
-                   data_plane::ObDirectInsertRowView(
-                       datums.get_data(), datums.count())))) {
+    } else if (OB_ISNULL(child_brs)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (0 == child_brs->size_) {
+      if (child_brs->end_) {
+        is_all_partition_finished_ = true;
+      }
+    } else {
+      batch_guard.set_batch_size(child_brs->size_);
+      for (int64_t batch_idx = 0; OB_SUCC(ret) && batch_idx < child_brs->size_; ++batch_idx) {
+        if (OB_NOT_NULL(child_brs->skip_) && child_brs->skip_->at(batch_idx)) {
+          continue;
+        }
+        batch_guard.set_batch_idx(batch_idx);
+        if (OB_UNLIKELY(need_update_tablet_range_count)
+                   && OB_FAIL(direct_insert_session_->prepare_ordered_input())) {
+        } else if (FALSE_IT(need_update_tablet_range_count = false)) {
+        } else if (OB_FAIL(get_tablet_info_from_row(child_->get_spec().output_, tablet_id, &slice_param))) {
+        } else if (OB_FAIL(switch_slice_if_need(
+                       tablet_id, slice_param.slice_idx_, slice_writer,
+                       &autoinc_param))) {
+        } else if (autoinc_param.enabled_ && FALSE_IT(
+              get_eval_ctx().exec_ctx_.set_ddl_idempotent_autoinc_params(autoinc_param.slice_count_,
+                                                                         autoinc_param.slice_index_,
+                                                                         slice_writer->get_row_count(),
+                                                                         autoinc_param.range_interval_))) {
+        } else if (OB_FAIL(eval_current_row(datums))) {
+        } else if (OB_FAIL(slice_writer->append_row(
+                       data_plane::ObDirectInsertRowView(
+                           datums.get_data(), datums.count())))) {
+        } else {
+          ++op_monitor_info_.otherstat_2_value_;
+        }
+      }
+      if (OB_SUCC(ret) && child_brs->end_) {
+        is_all_partition_finished_ = true;
+      }
     }
   }
   if (OB_SUCC(ret) && is_all_partition_finished_ && nullptr != slice_writer) {

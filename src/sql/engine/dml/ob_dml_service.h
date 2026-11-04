@@ -21,6 +21,7 @@
 #include "data_plane/ob_i_dml_service.h"
 #include "data_plane/ob_i_write_context_service.h"
 #include "sql/das/ob_das_context.h"
+#include "storage/fts/ob_fts_result_cache.h"
 #include "ob_table_modify_op.h"
 
 namespace oceanbase
@@ -297,6 +298,16 @@ private:
                                         ObDMLBaseRtDef &dml_rtdef);
 };
 
+template <typename CtDef>
+static int bump_fts_content_version(const CtDef *ctdef)
+{
+  int ret = common::OB_SUCCESS;
+  if (OB_NOT_NULL(ctdef) && ctdef->table_param_.get_data_table().is_domain_index()) {
+    storage::ObFtsContentVersion::instance().bump();
+  }
+  return ret;
+}
+
 template <int N, typename DMLIterator>
 class ObDASIndexDMLAdaptor
 {
@@ -389,6 +400,7 @@ int ObDASIndexDMLAdaptor<N, DMLIterator>::write_tablet(DMLIterator &iter, int64_
                                       *related_rtdef,
                                       iter,
                                       index_affected_rows))) {
+        } else if (OB_FAIL(bump_fts_content_version(related_ctdef))) {
         } else if (OB_FAIL(ObDMLService::check_local_index_affected_rows(affected_rows,
                                                                          index_affected_rows,
                                                                          *ctdef_,
@@ -484,6 +496,7 @@ int ObDASIndexDMLAdaptor<N, DMLIterator>::write_tablet_with_ignore(DMLIterator &
                                         *related_rtdef,
                                         single_row_iter,
                                         index_affected_rows))) {
+          } else if (OB_FAIL(bump_fts_content_version(related_ctdef))) {
           } else if (OB_FAIL(ObDMLService::check_local_index_affected_rows(table_affected_rows,
                                                                            index_affected_rows,
                                                                            *ctdef_,

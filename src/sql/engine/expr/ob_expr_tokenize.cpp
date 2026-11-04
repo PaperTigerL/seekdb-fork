@@ -16,6 +16,11 @@
 
 #include "sql/engine/expr/ob_expr_tokenize.h"
 
+#include <chrono>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
 #include "lib/alloc/alloc_struct.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
@@ -39,6 +44,127 @@ namespace oceanbase
 {
 namespace sql
 {
+namespace
+{
+constexpr int64_t TOKENIZE_CACHE_MAX_ENTRIES = 256;
+constexpr int64_t TOKENIZE_CACHE_MAX_VALUE_SIZE = 64 * 1024;
+constexpr int64_t TOKENIZE_CACHE_MAX_TOTAL_SIZE = 8 * 1024 * 1024;
+constexpr int64_t TOKENIZE_CACHE_TTL_MS = 60 * 1000;
+
+struct ObTokenizeCacheEntry
+{
+  std::string value_;
+  int64_t expire_ts_;
+};
+
+// Tokenization is a pure function of (text, parser, properties, charset), so
+// repeated calls with identical input can reuse the serialized result.
+class ObTokenizeResultCache
+{
+public:
+  static ObTokenizeResultCache &instance()
+  {
+    static ObTokenizeResultCache cache;
+    return cache;
+  }
+
+  bool get(const std::string &key, std::string &value)
+  {
+    bool found = false;
+    const int64_t now = now_ms();
+    std::lock_guard<std::mutex> guard(lock_);
+    std::unordered_map<std::string, ObTokenizeCacheEntry>::iterator iter = map_.find(key);
+    if (iter != map_.end()) {
+      if (iter->second.expire_ts_ > now) {
+        value = iter->second.value_;
+        found = true;
+      } else {
+        total_size_ -= static_cast<int64_t>(iter->second.value_.size());
+        map_.erase(iter);
+      }
+    }
+    return found;
+  }
+
+  void put(const std::string &key, const char *data, const int64_t len)
+  {
+    if (len <= 0 || len > TOKENIZE_CACHE_MAX_VALUE_SIZE) {
+      return;
+    }
+    const int64_t now = now_ms();
+    std::lock_guard<std::mutex> guard(lock_);
+    if (map_.size() >= TOKENIZE_CACHE_MAX_ENTRIES
+        || total_size_ + len > TOKENIZE_CACHE_MAX_TOTAL_SIZE) {
+      map_.clear();
+      total_size_ = 0;
+    }
+    ObTokenizeCacheEntry entry;
+    entry.value_.assign(data, static_cast<size_t>(len));
+    entry.expire_ts_ = now + TOKENIZE_CACHE_TTL_MS;
+    std::pair<std::unordered_map<std::string, ObTokenizeCacheEntry>::iterator, bool> ins =
+        map_.insert_or_assign(key, std::move(entry));
+    total_size_ += static_cast<int64_t>(ins.first->second.value_.size());
+  }
+
+private:
+  static int64_t now_ms()
+  {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  std::mutex lock_;
+  std::unordered_map<std::string, ObTokenizeCacheEntry> map_;
+  int64_t total_size_ = 0;
+};
+
+inline void append_cache_field(std::string &key, const void *data, const int64_t len)
+{
+  key.append(reinterpret_cast<const char *>(&len), sizeof(len));
+  if (len > 0 && nullptr != data) {
+    key.append(static_cast<const char *>(data), static_cast<size_t>(len));
+  }
+}
+
+class ObExprTokenizeCacheKeyBuilder
+{
+public:
+  static int build(const ObExpr &expr, ObEvalCtx &ctx, bool &cacheable, std::string &key)
+  {
+    int ret = OB_SUCCESS;
+    ObDatum *fulltext_datum = nullptr;
+    ObDatum *parser_datum = nullptr;
+    cacheable = false;
+    // parser properties (3-arg form) are not part of the fast key; skip caching.
+    if (expr.arg_cnt_ >= 1 && expr.arg_cnt_ <= 2) {
+      ObString fulltext;
+      ObString parser_name = ObString::make_string(OB_DEFAULT_FULLTEXT_PARSER_NAME);
+      if (OB_FAIL(expr.args_[0]->eval(ctx, fulltext_datum))) {
+      } else if (2 == expr.arg_cnt_ && OB_FAIL(expr.args_[1]->eval(ctx, parser_datum))) {
+      } else {
+        if (!fulltext_datum->is_null()) {
+          fulltext = fulltext_datum->get_string();
+        }
+        if (2 == expr.arg_cnt_ && !parser_datum->is_null()) {
+          parser_name = parser_datum->get_string().trim();
+        }
+        const int64_t cs_type =
+            static_cast<int64_t>(expr.args_[0]->obj_meta_.get_collation_type());
+        // 1-2 arg calls always use the default output mode
+        const int64_t mode = 0;
+        key.reserve(static_cast<size_t>(fulltext.length() + parser_name.length()) + 64);
+        append_cache_field(key, &cs_type, sizeof(cs_type));
+        append_cache_field(key, &mode, sizeof(mode));
+        append_cache_field(key, parser_name.ptr(), parser_name.length());
+        append_cache_field(key, fulltext.ptr(), fulltext.length());
+        cacheable = true;
+      }
+    }
+    return ret;
+  }
+};
+} // namespace
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -54,22 +180,44 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
 {
   int ret = OB_SUCCESS;
 
-  ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-  common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
-
-  ObIJsonBase *json_result = nullptr;
-  TokenizeParam param;
+  bool cacheable = false;
+  bool cache_hit = false;
+  std::string cache_key;
 
   // check param num, which is checked in ObExprOperator::calc_result_typeN.
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else if (OB_FAIL(ObExprTokenizeCacheKeyBuilder::build(expr, ctx, cacheable, cache_key))) {
+  } else if (cacheable) {
+    std::string cached;
+    if (ObTokenizeResultCache::instance().get(cache_key, cached)) {
+      ObString cached_str(static_cast<int32_t>(cached.size()), cached.data());
+      if (OB_FAIL(ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, cached_str))) {
+      } else {
+        cache_hit = true;
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && !cache_hit) {
+    ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
+    common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
+    ObIJsonBase *json_result = nullptr;
+    TokenizeParam param;
+    if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
+    } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+    } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
+                                                       ctx,
+                                                       temp_allocator,
+                                                       json_result,
+                                                       expr_datum))) {
+    } else if (cacheable) {
+      ObString raw;
+      // cache fill failure only costs a later recompute
+      if (OB_SUCCESS == share::ObJsonWrapper::get_raw_binary(json_result, raw, &temp_allocator)) {
+        ObTokenizeResultCache::instance().put(cache_key, raw.ptr(), raw.length());
+      }
+    }
   }
 
   return ret;
